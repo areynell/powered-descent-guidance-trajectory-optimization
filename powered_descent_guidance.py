@@ -5,10 +5,11 @@
 # 3) Use Hermite interpolation polynomial to get smoother trajectory plots
 # 4) Plot midpoints as well
 
+# TODO: Use polynomial trajectories for state and controls that match collocation method
+
 import numpy as np
 import casadi as ca
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
 from time import time
 
 # System dynamics
@@ -22,18 +23,15 @@ def dynamics(state, control, params):
     ux = control[0]
     uy = control[1]
 
-    G = params[0]
-    M = params[1]
-
-    # Mass flow rate coefficient
-    alpha = 0.001
+    G, M, R, Isp, g0 = params
+    eps_thrust = 1e-6  # small smoothing to avoid NaN gradients at u=0
 
     # Equations of motion
     dx = vx
     dy = vy
     dvx = -G*M*x/(x**2 + y**2)**(3/2) + ux/m
     dvy = -G*M*y/(x**2 + y**2)**(3/2) + uy/m
-    dm = -alpha*ca.sqrt(ux**2 + uy**2 + 1.0e-6)
+    dm = -ca.sqrt(ux**2 + uy**2 + eps_thrust)/(Isp*g0)
 
     return ca.vertcat(dx, dy, dvx, dvy, dm)
 
@@ -125,29 +123,19 @@ def add_gauss_lobatto_dynamic_constraints(opti, X, U, N, dt, params):
 
         opti.subject_to(xk_next == xk + dt * integral)
 
-def main():
-    # Parameters
-    N = 100  # Number of control intervals
+def run_optimization(initial_conditions, terminal_conditions, params, N):
+    """
+    Sets up and solves a single trajectory optimization problem.
+    """
 
-    R = 6.371e6    # Radius of Earth (m)
-    G = 6.672e-11  # Gravitational constant
-    M = 5.972e24   # Mass of Earth (kg)
-    params = [G, M]
-
-    # Randomized initial conditions
-    t0 = 0.0
-    x0 = np.random.uniform(-1000.0, 1000.0) # 100.0
-    y0 = R + np.random.uniform(100.0, 1000.0) # R + 100.0
-    vx0 = np.random.uniform(-250.0, 250.0) # 100.0
-    vy0 = np.random.uniform(-100.0, 0.0) # 0.0
-    m0 = 100.0 #  100.0
+    # Initial conditions
+    x0, y0, vx0, vy0, m0 = initial_conditions
 
     # Terminal conditions
-    xf = 0.0
-    yf = R
-    vxf = 0.0
-    vyf = 0.0
-    mf = 10.0  # Minimum allowable final mass
+    xf, yf, vxf, vyf, mf = terminal_conditions
+
+    # Constants
+    G, M, R, Isp, g0 = params
 
     # Control bounds
     u_min = -10000.0
@@ -161,10 +149,14 @@ def main():
     opti = ca.Opti()
 
     # Time horizon (free)
+    # t_min = 1.0
+    # t_max = 100.0
     tf = opti.variable()
+    # opti.subject_to(opti.bounded(t_min, tf, t_max))
     opti.subject_to(tf > 0)
 
     # Time step
+    # Question: Is there a better way we can incorporate a free final time? "tdot = 1" or "time scaling"?
     dt = tf / N
 
     # State variables
@@ -188,27 +180,36 @@ def main():
     opti.subject_to(m[0] == m0)
 
     # Final constraints
-    opti.subject_to(x[-1] == xf)
-    opti.subject_to(y[-1] == yf)
-    opti.subject_to(vx[-1] == vxf)
-    opti.subject_to(vy[-1] == vyf)
-    opti.subject_to(m[-1] >= mf)
+    eps_pos = 1.0     # meters
+    eps_vel = 0.5     # m/s
+    opti.subject_to(opti.bounded(xf - eps_pos, x[-1], xf + eps_pos))
+    opti.subject_to(opti.bounded(yf - eps_pos, y[-1], yf + eps_pos))
+    opti.subject_to(opti.bounded(vxf - eps_vel, vx[-1], vxf + eps_vel))
+    opti.subject_to(opti.bounded(vyf - eps_vel, vy[-1], vyf + eps_vel))
+    # opti.subject_to(m[-1] >= mf)
 
     # Control constraints
     opti.subject_to(opti.bounded(u_min, ux, u_max))
     opti.subject_to(opti.bounded(u_min, uy, u_max))
 
     # Mass constraints (mass cannot increase)
+    # NOTE: This constraint really seems to help produce faster convergence and avoid infeasible solutions, why?
     for k in range(N):
         opti.subject_to(m[k+1] <= m[k])
 
-    # add_hermite_simpson_dynamic_constraints(opti, X, U, N, dt, params)
-    add_gauss_lobatto_dynamic_constraints(opti, X, U, N, dt, params)
+    # # Path constraints (keep vehicle above the surface and mass positive)
+    # r = ca.sqrt(x**2 + y**2)
+    # opti.subject_to(r >= R)
+    opti.subject_to(m >= mf)  # Keep mass above dry-mass lower bound everywhere
+
+    add_hermite_simpson_dynamic_constraints(opti, X, U, N, dt, params)
+    # add_gauss_lobatto_dynamic_constraints(opti, X, U, N, dt, params)
 
     # Objective: Maximize final mass (by minimizing negative final mass)
     opti.minimize(-m[-1])
 
     # Initial guess for decision variables
+    # NOTE: Using a more reasonable guess (e.g. 20 seconds) actually produces more infeasible results, why?
     opti.set_initial(tf, 100.0)
 
     for i in range(N+1):
@@ -221,6 +222,8 @@ def main():
         opti.set_initial(m[i], (1-t_frac)*m0 + t_frac*mf)
 
         if i < N:
+            # opti.set_initial(ux[i], 1e-6)
+            # opti.set_initial(uy[i], 1e-6)
             opti.set_initial(ux[i], 0.0)
             opti.set_initial(uy[i], 0.0)
 
@@ -232,99 +235,155 @@ def main():
         'ipopt.tol': 1e-6
     })
 
-    # Solve the optimization problem
-    print("Solving optimization problem...")
-    t_start = time()
-    sol = opti.solve()
-    t_end = time()
-    print(f"Solution found in {t_end - t_start:.2f} seconds")
+    try:
+        # Solve the optimization problem
+        sol = opti.solve()
 
-    # Extract solution
-    tf_opt = sol.value(tf)
-    x_opt = sol.value(x)
-    y_opt = sol.value(y)
-    vx_opt = sol.value(vx)
-    vy_opt = sol.value(vy)
-    m_opt = sol.value(m)
-    ux_opt = sol.value(ux)
-    uy_opt = sol.value(uy)
+        solution_stats = opti.stats()
+        inf_pr_history = solution_stats['iterations']['inf_pr']
+        inf_du_history = solution_stats['iterations']['inf_du']
+        mu_history = solution_stats['iterations']['mu']
+        d_norm_history = solution_stats['iterations']['d_norm']
+        alpha_pr_history = solution_stats['iterations']['alpha_pr']
+        alpha_du_history = solution_stats['iterations']['alpha_du']
+        iterations = len(alpha_du_history)
 
-    print(f"Optimal time: {tf_opt:.4f} s")
-    print(f"Final mass: {m_opt[-1]:.4f} kg")
+        # # 4-row subplot figure
+        # fig, axs = plt.subplots(4, 1, figsize=(9, 12), sharex=False)
 
-    # Time vector for plotting
-    t = np.linspace(0, tf_opt, N+1)
+        # axs[0].semilogy(inf_pr_history, label='inf_pr')
+        # axs[0].semilogy(inf_du_history, label='inf_du')
+        # axs[0].set_title('IPOPT infeasibilities')
+        # axs[0].grid(True)
+        # axs[0].legend()
 
-    # Plot results
-    plt.figure(figsize=(12, 10))
+        # axs[1].semilogy(mu_history, label='mu')
+        # axs[1].set_title('Barrier parameter (mu)')
+        # axs[1].grid(True)
+        # axs[1].legend()
 
-    plt.subplot(5, 1, 1)
-    plt.plot(t, np.sqrt(x_opt**2 + (y_opt)**2), label='Radial Position')
-    plt.grid(True)
-    plt.xlabel('Time [s]')
-    plt.ylabel('Radial Position [m]')
-    plt.legend()
-    plt.tight_layout()
+        # axs[2].plot(alpha_pr_history, label='alpha_pr')
+        # axs[2].plot(alpha_du_history, label='alpha_du')
+        # axs[2].set_title('Step sizes')
+        # axs[2].grid(True)
+        # axs[2].legend()
 
-    plt.subplot(5, 1, 2)
-    plt.plot(t, x_opt, label='x')
-    plt.plot(t, y_opt - R, label='y - R')
-    plt.grid(True)
-    plt.xlabel('Time [s]')
-    plt.ylabel('Position [m]')
-    plt.legend()
+        # axs[3].semilogy(d_norm_history, label='d_norm')
+        # axs[3].set_title('Search direction norm')
+        # axs[3].set_xlabel('Iteration')
+        # axs[3].grid(True)
+        # axs[3].legend()
 
-    plt.subplot(5, 1, 3)
-    plt.plot(t, vx_opt, label='vx')
-    plt.plot(t, vy_opt, label='vy')
-    plt.grid(True)
-    plt.xlabel('Time [s]')
-    plt.ylabel('Velocity [m/s]')
-    plt.legend()
+        # plt.tight_layout()
+        # plt.show()
 
-    plt.subplot(5, 1, 4)
-    plt.plot(t, m_opt, label='Mass')
-    plt.grid(True)
-    plt.xlabel('Time [s]')
-    plt.ylabel('Mass [kg]')
-    plt.legend()
+        # Extract solution
+        print(f"--- Run succeeded ---")
+        return {
+            "success": True,
+            "iters": iterations,
+            "tf_opt": sol.value(tf),
+            "x_opt": sol.value(x),
+            "y_opt": sol.value(y),
+            "m_opt": sol.value(m),
+        }
+    except Exception as e:
+        print(f"--- Run failed: {e} ---")
+        return {"success": False}
 
-    plt.subplot(5, 1, 5)
-    t_control = t[:-1]  # Control points are one fewer than state points
-    plt.step(t_control, ux_opt, label='ux', where='post')
-    plt.step(t_control, uy_opt, label='uy', where='post')
-    plt.grid(True)
-    plt.xlabel('Time [s]')
-    plt.ylabel('Control [N]')
-    plt.legend()
+def main():
+    # Parameters
+    N = 50  # Number of control intervals
+    num_runs = 10 # Number of randomized runs to perform
 
-    # Trajectory plot with thrust vectors
-    plt.figure(figsize=(10, 10))
-    plt.plot(x_opt, y_opt, 'b-', label='Trajectory')
-    plt.plot(x_opt[0], y_opt[0], 'go', label='Start')
-    plt.plot(x_opt[-1], y_opt[-1], 'ro', label='End')
+    G = 6.672e-11  # Gravitational constant
+    M = 5.972e24   # Mass of Earth (kg)
+    R = 6.371e6    # Radius of Earth (m)
+    Isp = 300.0    # Rocket engine specific impulse in seconds
+    g0 = 9.81      # Standard gravity in m/s^2
+    params = [G, M, R, Isp, g0]
 
-    # Draw thrust vectors
-    thrust_scale = 0.001  # Scale factor for visualization
-    for i in range(N):
-        # Calculate thrust magnitude
-        thrust_magnitude = np.sqrt(ux_opt[i]**2 + uy_opt[i]**2)
+    results = []
 
-        # Only draw arrows if thrust magnitude is significant
-        if thrust_magnitude > 1.0:  # Threshold to avoid drawing very small vectors
-            plt.arrow(x_opt[i], y_opt[i],
-                     thrust_scale * ux_opt[i], thrust_scale * uy_opt[i],
-                     head_width=1, head_length=1, fc='r', ec='r',
-                     length_includes_head=True, alpha=1.0)
+    # Fixed terminal conditions for all runs
+    terminal_conditions = (
+        0.0,    # xf
+        R,      # yf
+        0.0,    # vxf
+        0.0,    # vyf
+        10.0    # mf (minimum allowable final mass)
+    )
 
-    plt.axis('equal')
-    plt.grid(True)
-    plt.xlabel('x [m]')
-    plt.ylabel('y [m]')
-    plt.title('Powered Descent Trajectory with Thrust Vectors')
-    plt.legend()
+    t_start_total = time()
+    for i in range(num_runs):
+        print(f"--- Starting run {i+1}/{num_runs} ---")
+        # Randomized initial conditions
+        initial_conditions = (
+            np.random.uniform(-1000.0, 1000.0), # x0
+            R + np.random.uniform(100.0, 1000.0), # y0
+            np.random.uniform(-250.0, 250.0), # vx0
+            np.random.uniform(-100.0, 0.0), # vy0
+            100.0 # m0
+        )
 
-    plt.show()
+        result = run_optimization(initial_conditions, terminal_conditions, params, N)
+        results.append(result)
+    t_end_total = time()
+
+    print(f"\nFinished {num_runs} runs in {t_end_total - t_start_total:.2f} seconds.")
+
+    # --- Summarize Results ---
+    successful_runs = [r for r in results if r["success"]]
+    num_success = len(successful_runs)
+
+    print("\n--- Overall Summary ---")
+    print(f"Total runs attempted: {num_runs}")
+    print(f"Successful runs: {num_success} ({num_success/num_runs*100:.1f}%)")
+
+    if num_success > 0:
+        final_masses = [r["m_opt"][-1] for r in successful_runs]
+        final_times = [r["tf_opt"] for r in successful_runs]
+        iters = [r["iters"] for r in successful_runs]
+
+        print("\nIterations (successful runs):")
+        print(f"  Min: {int(np.min(iters))}")
+        print(f"  Max: {int(np.max(iters))}")
+        print(f"  Mean: {float(np.mean(iters)):.1f}")
+        print(f"  Standard Deviation: {float(np.std(iters)):.1f}")
+
+        print("\nFinal Mass (kg):")
+        print(f"  Avg: {np.mean(final_masses):.2f}")
+        print(f"  Std: {np.std(final_masses):.2f}")
+        print(f"  Min: {np.min(final_masses):.2f}")
+        print(f"  Max: {np.max(final_masses):.2f}")
+
+        print("\nOptimal Time (s):")
+        print(f"  Avg: {np.mean(final_times):.2f}")
+        print(f"  Std: {np.std(final_times):.2f}")
+        print(f"  Min: {np.min(final_times):.2f}")
+        print(f"  Max: {np.max(final_times):.2f}")
+
+        # Plot all successful trajectories
+        plt.figure(figsize=(10, 10))
+        for i, run in enumerate(successful_runs):
+            if i == 0:
+                # Add labels only for the first trajectory to avoid clutter
+                plt.plot(run["x_opt"], run["y_opt"], 'b--', alpha=0.6, label='Trajectories')
+                plt.plot(run["x_opt"][0], run["y_opt"][0], 'ro', label='Start Point')
+                plt.plot(run["x_opt"][-1], run["y_opt"][-1], 'go', label='End Point')
+            else:
+                plt.plot(run["x_opt"], run["y_opt"], 'b--', alpha=0.6)
+                plt.plot(run["x_opt"][0], run["y_opt"][0], 'ro')
+                plt.plot(run["x_opt"][-1], run["y_opt"][-1], 'go')
+
+
+        plt.axis('equal')
+        plt.grid(True)
+        plt.xlabel('x [m]')
+        plt.ylabel('y [m]')
+        plt.title(f'All {num_success} Successful Trajectories')
+        plt.legend()
+        plt.show()
 
 if __name__ == "__main__":
     main()
