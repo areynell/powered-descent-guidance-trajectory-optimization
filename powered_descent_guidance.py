@@ -2,290 +2,244 @@
 # 0) Add drag force
 # 1) Make 2D animation of trajectory and control input
 # 2) Scale variables for faster/more robust convergence
-# 3) Use Hermite interpolation polynomial to get smoother trajectory plots
+# 3) Use polynomial trajectories for state and controls that match collocation method
 # 4) Plot midpoints as well
+# 5) Try different collocation methods
+# 6) Move from 2D to 3D
 
-# TODO: Use polynomial trajectories for state and controls that match collocation method
-# TODO: Ensure that different scaling is applied to x and y position (e.g. x ~ O(0) whereas y ~ O(R), so can't use same scale for x and y)
-
-from pdb import run
 import numpy as np
 import casadi as ca
 import matplotlib.pyplot as plt
 from time import time
 
-# System dynamics
-def dynamics(state, control, params):
+def dynamics_scaled(state_scaled, control_scaled, params, scales):
     """
-    Compute the dynamics of the system.
+    Compute the dimensionless/scaled dynamics of the system.
     """
 
-    x = state[0]
-    y = state[1]
-    vx = state[2]
-    vy = state[3]
-    m = state[4]
+    x_s = state_scaled[0]
+    y_s = state_scaled[1]
+    vx_s = state_scaled[2]
+    vy_s = state_scaled[3]
+    m_s = state_scaled[4]
 
-    ux = control[0]
-    uy = control[1]
-
-    # TODO: Scale variables correctly
-    # TODO: Make position w.r.t. local point on surface of Earth, instead of w.r.t. center of Earth
+    ux_s = control_scaled[0]
+    uy_s = control_scaled[1]
 
     # Unpack parameters
-    G, M, R, Isp, g0, rho0, H, Cd, A = params
-    # eps_radius = 1e-9      # smoothing for |r| at r≈0
-    # eps_vel = 1e-9      # smoothing for |v| at v≈0
-    eps_thrust = 1e-6   # smoothing to avoid NaN gradients at u=0
+    G = params['G']
+    M = params['M']
+    Isp = params['Isp']
+    g0 = params['g0']
 
-    # Two-body gravity
-    ax_gravity = -G*M*x/(x**2 + y**2)**(3/2)
-    ay_gravity = -G*M*y/(x**2 + y**2)**(3/2)
+    # Unpack scales
+    length_scale = scales['length']
+    velocity_scale = scales['velocity']
+    time_scale = scales['time']
+    mass_scale = scales['mass']
+    thrust_scale = scales['thrust']
 
-    # # Atmospheric density (exponential with scale height)
-    # r = ca.sqrt(x**2 + y**2 + eps_radius)
-    # h = r - R
-    # rho = rho0 * ca.exp(-h / H)
+    # Example derivation of dimensionless scale factors for dvx/dt:
+    # --------------------------------------------------------------
+    # LHS: dvx/dt = d(velocity_scale * vx_s) / d(time_scale * t_s) = (velocity_scale/time_scale) * dvx_s/dt_s
+    # RHS: -G*M*x/r^3 + ux/m = -G*M*(length_scale*x_s)/sqrt((length_scale*x_s)^2 + (length_scale*y_s)^2)^3 + (thrust_scale*ux_s)/(mass_scale*m_s)
+    # RHS: -G*M*x/r^3 + ux/m = -G*M*(length_scale*x_s)/(length_scale^3*sqrt(x_s^2 + y_s^2)^3) + (thrust_scale/mass_scale)*(ux_s/m_s)
+    # RHS: -G*M*x/r^3 + ux/m = -(1/length_scale^2)*G*M*x_s/r_s^3 + (thrust_scale/mass_scale)*(ux_s/m_s)
+    # Therefore, we have
+    # (velocity_scale/time_scale) * dvx_s/dt_s = - (1/length_scale^2)*G*M*x_s/r_s^3 + (thrust_scale/mass_scale)*(ux_s/m_s)
+    # Rearranging, we get:
+    # dvx_s/dt_s = -(time_scale/(velocity_scale*length_scale^2))*G*M*x_s/r_s^3 + ((thrust_scale*time_scale)/(mass_scale*velocity_scale))*(ux_s/m_s)
 
-    # # Aerodynamic drag: Fd = 0.5*rho*Cd*A*|v|*v
-    # v = ca.sqrt(vx**2 + vy**2 + eps_vel)
-    # ax_drag = -(0.5 * rho * Cd * A * v * vx) / m
-    # ay_drag = -(0.5 * rho * Cd * A * v * vy) / m
+    # Dimensionless scale factors
+    alpha = (velocity_scale * time_scale) / length_scale                # Position scale factor
+    beta = time_scale / (velocity_scale * length_scale**2)              # Velocity scale factor
+    gamma = (thrust_scale * time_scale) / (mass_scale * velocity_scale) # Mass scale factor
+    kappa = (thrust_scale * time_scale) / mass_scale                    # Control scale factor
 
-    T = ca.sqrt(ux**2 + uy**2 + eps_thrust)  # Thrust magnitude
-
-    # Thrust acceleration
-    ax_thrust = ux / m
-    ay_thrust = uy / m
+    # TODO: Find a better way to handle the singularity at u=0, since convergence seems very reliant on eps_thrust value
+    # eps_thrust_s = 1e-3 / thrust_scale
+    eps_thrust_s = 1.0e-3
+    r_s = ca.sqrt(x_s**2 + y_s**2) # Distance from center of planet
+    T_s = ca.sqrt(ux_s**2 + uy_s**2 + eps_thrust_s**2)  # Thrust magnitude
+    mu_s = beta * G * M # Scaled gravitational parameter
 
     # Equations of motion
-    dxdt = vx
-    dydt = vy
-    dvxdt = ax_gravity + ax_thrust# + ax_drag
-    dvydt = ay_gravity + ay_thrust# + ay_drag
-    dmdt = -T/(Isp*g0)
+    dx_s_dt_s = alpha * vx_s
+    dy_s_dt_s = alpha * vy_s
+    dvx_s_dt_s = -mu_s * (x_s/r_s**3) + gamma * (ux_s / m_s)
+    dvy_s_dt_s = -mu_s * (y_s/r_s**3) + gamma * (uy_s / m_s)
+    dm_s_dt_s = -kappa*T_s/(Isp*g0)
 
-    return ca.vertcat(dxdt, dydt, dvxdt, dvydt, dmdt)
+    return ca.vertcat(dx_s_dt_s, dy_s_dt_s, dvx_s_dt_s, dvy_s_dt_s, dm_s_dt_s)
 
-def add_hermite_simpson_dynamic_constraints(opti, X, U, N, dt, params):
+def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, scales, N):
     """
     Add dynamic constraints using Hermite-Simpson collocation.
     """
 
-    # Dynamic constraints using Hermite-Simpson collocation
     for k in range(N):
-        # State at beginning of interval
-        xk = X[:, k]
-        # Control at beginning of interval
-        uk = U[:, k]
-
-        # State at end of interval
-        xk_next = X[:, k+1]
-        # Control at end of interval (if k < N-1)
-        uk_next = U[:, min(k+1, N-1)]
+        xk = X_scaled[:, k]
+        uk = U_scaled[:, k]
+        xk_next = X_scaled[:, k+1]
+        uk_next = U_scaled[:, k+1]
 
         # Dynamics at beginning and end of interval
-        fk = dynamics(xk, uk, params)
-        fk_next = dynamics(xk_next, uk_next, params)
+        fk = dynamics_scaled(xk, uk, params, scales)
+        fk_next = dynamics_scaled(xk_next, uk_next, params, scales)
 
         # Midpoint state (Hermite interpolation)
-        xk_mid = 0.5 * (xk + xk_next) + (dt/8) * (fk - fk_next)
+        xk_mid = 0.5 * (xk + xk_next) + (dt_scaled/8.0) * (fk - fk_next)
 
         # Midpoint control (linear interpolation)
         uk_mid = 0.5 * (uk + uk_next)
 
         # Dynamics at midpoint
-        fk_mid = dynamics(xk_mid, uk_mid, params)
+        fk_mid = dynamics_scaled(xk_mid, uk_mid, params, scales)
 
         # Simpson integration
-        opti.subject_to(xk_next == xk + (dt/6) * (fk + 4*fk_mid + fk_next))
+        opti.subject_to(xk_next == xk + (dt_scaled/6.0) * (fk + 4.0*fk_mid + fk_next))
 
-def add_gauss_lobatto_dynamic_constraints(opti, X, U, N, dt, params):
-    """
-    Add dynamic constraints using higher-order Gauss-Lobatto collocation.
-    """
-
-    # Dynamic constraints using higher-order Gauss-Lobatto collocation
-    for k in range(N):
-        # State at beginning of interval
-        xk = X[:, k]
-        # Control at beginning of interval
-        uk = U[:, k]
-
-        # State at end of interval
-        xk_next = X[:, k+1]
-        # Control at end of interval (if k < N-1)
-        uk_next = U[:, min(k+1, N-1)]
-
-        # Dynamics at beginning and end of interval
-        fk = dynamics(xk, uk, params)
-        fk_next = dynamics(xk_next, uk_next, params)
-
-        # Define collocation points (Gauss-Lobatto 5th order)
-        tau = [0, 0.5 - np.sqrt(15)/10, 0.5, 0.5 + np.sqrt(15)/10, 1]
-
-        # Evaluate state at collocation points
-        xc = [None] * len(tau)
-        fc = [None] * len(tau)
-        uc = [None] * len(tau)
-
-        # Start point
-        xc[0] = xk
-        uc[0] = uk
-        fc[0] = fk
-
-        # End point
-        xc[4] = xk_next
-        uc[4] = uk_next
-        fc[4] = fk_next
-
-        # Interior points using Lagrange interpolation for control
-        for i in range(1, 4):
-            # Control at collocation point (linear interpolation)
-            uc[i] = uk + tau[i] * (uk_next - uk)
-
-            # State at collocation point (using Hermite basis functions)
-            c1 = 1 - 3*tau[i]**2 + 2*tau[i]**3
-            c2 = tau[i] - 2*tau[i]**2 + tau[i]**3
-            c3 = 3*tau[i]**2 - 2*tau[i]**3
-            c4 = -tau[i]**2 + tau[i]**3
-
-            xc[i] = c1*xk + c2*dt*fk + c3*xk_next + c4*dt*fk_next
-            fc[i] = dynamics(xc[i], uc[i], params)
-
-        # Gauss-Lobatto weights for 5-point quadrature
-        weights = [1/20, 49/180, 32/90, 49/180, 1/20]
-
-        # Integration constraint
-        integral = 0
-        for i in range(len(tau)):
-            integral += weights[i] * fc[i]
-
-        opti.subject_to(xk_next == xk + dt * integral)
-
-def run_optimization(initial_conditions, terminal_conditions, params, N):
+def run_optimization(initial_conditions, terminal_conditions, params, bounds, tolerances, scales, N):
     """
     Set up the objective function and constraints, and solve a single trajectory optimization problem.
     """
-
-    # Initial conditions
-    x0, y0, vx0, vy0, m0 = initial_conditions
-
-    # Terminal conditions
-    xf, yf, vxf, vyf, mf = terminal_conditions
-
-    # # Constants
-    G, M, R, Isp, g0, rho0, H, Cd, A = params
-
-    # Control bounds
-    u_min = -10000.0
-    u_max = 10000.0
 
     # State dimensions
     num_states = 5  # [x, y, vx, vy, m]
     num_controls = 2  # [ux, uy]
 
+    # Scaled initial conditions
+    x0_scaled = initial_conditions['x0'] / scales['length']
+    y0_scaled = initial_conditions['y0'] / scales['length']
+    vx0_scaled = initial_conditions['vx0'] / scales['velocity']
+    vy0_scaled = initial_conditions['vy0'] / scales['velocity']
+    m0_scaled = initial_conditions['m0'] / scales['mass']
+
+    # Scaled terminal conditions
+    xf_scaled = terminal_conditions['xf'] / scales['length']
+    yf_scaled = terminal_conditions['yf'] / scales['length']
+    vxf_scaled = terminal_conditions['vxf'] / scales['velocity']
+    vyf_scaled = terminal_conditions['vyf'] / scales['velocity']
+    mf_scaled = terminal_conditions['mf'] / scales['mass']
+
+    # Scaled control bounds
+    u_min_scaled = bounds['u_min'] / scales['thrust']
+    u_max_scaled = bounds['u_max'] / scales['thrust']
+
+    # Scaled time horizon bounds
+    t_min_scaled = bounds['t_min'] / scales['time']
+    t_max_scaled = bounds['t_max'] / scales['time']
+
+    # Scaled position and velocity tolerances for terminal constraints
+    position_tol_scaled = tolerances['position_tol'] / scales['length']
+    velocity_tol_scaled = tolerances['velocity_tol'] / scales['velocity']
+
     # Optimization variables
     opti = ca.Opti()
 
-    # Time horizon (free)
-    # t_min = 1.0
-    # t_max = 100.0
-    tf = opti.variable()
-    # opti.subject_to(opti.bounded(t_min, tf, t_max))
-    opti.subject_to(tf > 0)
+    # Scaled state variables
+    X_scaled = opti.variable(num_states, N+1)
+    x_scaled = X_scaled[0, :]
+    y_scaled = X_scaled[1, :]
+    vx_scaled = X_scaled[2, :]
+    vy_scaled = X_scaled[3, :]
+    m_scaled = X_scaled[4, :]
 
+    # Scaled control variables
+    U_scaled = opti.variable(num_controls, N+1)
+    ux_scaled = U_scaled[0, :]
+    uy_scaled = U_scaled[1, :]
+
+    # Scaled final time
+    tf_scaled = opti.variable()
     # Time step
     # NOTE: Is there a better way we can incorporate a free final time? "tdot = 1" or "time scaling"?
-    dt = tf / N
-
-    # State variables
-    X = opti.variable(num_states, N+1)
-    x = X[0, :]
-    y = X[1, :]
-    vx = X[2, :]
-    vy = X[3, :]
-    m = X[4, :]
-
-    # Control variables
-    U = opti.variable(num_controls, N)
-    ux = U[0, :]
-    uy = U[1, :]
+    dt_scaled = tf_scaled / N
 
     # Initial constraints
-    opti.subject_to(x[0] == x0)
-    opti.subject_to(y[0] == y0)
-    opti.subject_to(vx[0] == vx0)
-    opti.subject_to(vy[0] == vy0)
-    opti.subject_to(m[0] == m0)
+    opti.subject_to(x_scaled[0] == x0_scaled)
+    opti.subject_to(y_scaled[0] == y0_scaled)
+    opti.subject_to(vx_scaled[0] == vx0_scaled)
+    opti.subject_to(vy_scaled[0] == vy0_scaled)
+    opti.subject_to(m_scaled[0] == m0_scaled)
 
     # Final constraints
-    eps_pos = 1.0     # meters
-    eps_vel = 0.5     # m/s
-    opti.subject_to(opti.bounded(xf - eps_pos, x[-1], xf + eps_pos))
-    opti.subject_to(opti.bounded(yf - eps_pos, y[-1], yf + eps_pos))
-    opti.subject_to(opti.bounded(vxf - eps_vel, vx[-1], vxf + eps_vel))
-    opti.subject_to(opti.bounded(vyf - eps_vel, vy[-1], vyf + eps_vel))
+    opti.subject_to(opti.bounded(xf_scaled - position_tol_scaled, x_scaled[-1], xf_scaled + position_tol_scaled))
+    opti.subject_to(opti.bounded(yf_scaled - position_tol_scaled, y_scaled[-1], yf_scaled + position_tol_scaled))
+    opti.subject_to(opti.bounded(vxf_scaled - velocity_tol_scaled, vx_scaled[-1], vxf_scaled + velocity_tol_scaled))
+    opti.subject_to(opti.bounded(vyf_scaled - velocity_tol_scaled, vy_scaled[-1], vyf_scaled + velocity_tol_scaled))
+    opti.subject_to(opti.bounded(t_min_scaled, tf_scaled, t_max_scaled))
 
-    # Mass constraints (mass cannot increase)
-    # NOTE: This constraint really seems to help produce faster convergence and avoid infeasible solutions, why?
-    for k in range(N):
-        opti.subject_to(m[k+1] <= m[k])
-
-    # Control constraints
-    opti.subject_to(opti.bounded(u_min, ux, u_max))
-    opti.subject_to(opti.bounded(u_min, uy, u_max))
+    # # Control constraints
+    # opti.subject_to(opti.bounded(u_min_scaled, ux_scaled, u_max_scaled))
+    # opti.subject_to(opti.bounded(u_min_scaled, uy_scaled, u_max_scaled))
 
     # Path constraints
-    opti.subject_to(m >= mf)  # Keep mass above dry-mass lower bound everywhere
-    # opti.subject_to(x**2 + y**2 >= R**2) # Keep vehicle above surface
-    # opti.subject_to(ux**2 + uy**2 <= u_max**2)  # Thrust magnitude limit
+    R_scaled = params['R'] / scales['length']
+    opti.subject_to(m_scaled >= mf_scaled)  # Keep mass above dry-mass lower bound everywhere
+    opti.subject_to(x_scaled**2 + y_scaled**2 >= R_scaled**2) # Keep vehicle above surface
+    # opti.subject_to(x_scaled**2 + y_scaled**2 >= (0.9*R_scaled)**2) # Keep vehicle above surface
+    opti.subject_to(ux_scaled**2 + uy_scaled**2 <= u_max_scaled**2)  # Thrust magnitude limit
 
-    add_hermite_simpson_dynamic_constraints(opti, X, U, N, dt, params)
-    # add_gauss_lobatto_dynamic_constraints(opti, X, U, N, dt, params)
+    # Mass cannot increase over time
+    # NOTE: This constraint really seems to help produce faster convergence and avoid infeasible solutions, why?
+    for k in range(N):
+        opti.subject_to(m_scaled[k+1] <= m_scaled[k])
 
-    # Objective: Maximize final mass (by minimizing negative final mass)
-    opti.minimize(-m[-1])
+    # Dynamic equality constraints
+    add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, scales, N)
 
-    # Initial guess for decision variables
-    # NOTE: Using a more reasonable guess (e.g. 20 seconds) actually produces more infeasible results, why?
-    opti.set_initial(tf, 100.0)
+    # Objective function: Maximize final mass (by minimizing fuel use)
+    opti.minimize(-m_scaled[-1])
 
+    # Initial guess for time horizon
+    opti.set_initial(tf_scaled, (t_min_scaled + t_max_scaled) / 2.0)
+
+    # Initial guess for states and controls
     for i in range(N+1):
-        # Linear interpolation for state initial guess
+        # Linear interpolation for states
         t_frac = i / N
-        opti.set_initial(x[i], (1-t_frac)*x0 + t_frac*xf)
-        opti.set_initial(y[i], (1-t_frac)*y0 + t_frac*yf)
-        opti.set_initial(vx[i], (1-t_frac)*vx0 + t_frac*vxf)
-        opti.set_initial(vy[i], (1-t_frac)*vy0 + t_frac*vyf)
-        opti.set_initial(m[i], (1-t_frac)*m0 + t_frac*mf)
+        opti.set_initial(x_scaled[i], (1-t_frac)*x0_scaled + t_frac*xf_scaled)
+        opti.set_initial(y_scaled[i], (1-t_frac)*y0_scaled + t_frac*yf_scaled)
+        opti.set_initial(vx_scaled[i], (1-t_frac)*vx0_scaled + t_frac*vxf_scaled)
+        opti.set_initial(vy_scaled[i], (1-t_frac)*vy0_scaled + t_frac*vyf_scaled)
+        opti.set_initial(m_scaled[i], (1-t_frac)*m0_scaled + t_frac*mf_scaled)
 
-        if i < N:
-            # opti.set_initial(ux[i], 1e-6)
-            # opti.set_initial(uy[i], 1e-6)
-            opti.set_initial(ux[i], 0.0)
-            opti.set_initial(uy[i], 0.0)
+        # Zero for controls
+        opti.set_initial(ux_scaled[i], 0.0)
+        opti.set_initial(uy_scaled[i], 0.0)
 
     # Set up solver
     opti.solver('ipopt', {
         'ipopt.print_level': 5,
         'expand': True,
         'ipopt.max_iter': 5000,
-        'ipopt.tol': 1e-6
+        'ipopt.tol': 1e-6,
+        "ipopt.linear_solver": "mumps",
     })
 
     try:
         # Solve the optimization problem
+        t_start = time()
         sol = opti.solve()
+        t_end = time()
+        t_solve = t_end - t_start
 
         solution_stats = opti.stats()
-        inf_pr_history = solution_stats['iterations']['inf_pr']
-        inf_du_history = solution_stats['iterations']['inf_du']
-        mu_history = solution_stats['iterations']['mu']
-        d_norm_history = solution_stats['iterations']['d_norm']
-        alpha_pr_history = solution_stats['iterations']['alpha_pr']
-        alpha_du_history = solution_stats['iterations']['alpha_du']
-        iterations = len(alpha_du_history)
+        iterations = len(solution_stats['iterations']['inf_pr'])
+
+        # inf_pr_history = solution_stats['iterations']['inf_pr']
+        # inf_du_history = solution_stats['iterations']['inf_du']
+        # mu_history = solution_stats['iterations']['mu']
+        # d_norm_history = solution_stats['iterations']['d_norm']
+        # alpha_pr_history = solution_stats['iterations']['alpha_pr']
+        # alpha_du_history = solution_stats['iterations']['alpha_du']
+
+        # # print("inf_pr_history:")
+        # # print(inf_pr_history)
+
+        # # print("inf_du_history:")
+        # # print(inf_du_history)
 
         # # 4-row subplot figure
         # fig, axs = plt.subplots(4, 1, figsize=(9, 12), sharex=False)
@@ -316,19 +270,32 @@ def run_optimization(initial_conditions, terminal_conditions, params, N):
         # plt.tight_layout()
         # plt.show()
 
-        # Extract solution
+        # Extract and unscale solution
+        tf_opt = sol.value(tf_scaled) * scales['time']
+        x_opt = sol.value(x_scaled) * scales['length']
+        y_opt = sol.value(y_scaled) * scales['length']
+        vx_opt = sol.value(vx_scaled) * scales['velocity']
+        vy_opt = sol.value(vy_scaled) * scales['velocity']
+        m_opt = sol.value(m_scaled) * scales['mass']
+        ux_opt = sol.value(ux_scaled) * scales['thrust']
+        uy_opt = sol.value(uy_scaled) * scales['thrust']
+
         print(f"--- Run succeeded ---")
+        print(f"Converged in {iterations} iterations ({t_solve:.2f} seconds)")
+        print(f"Final time: {tf_opt:.2f} s")
+        print(f"Final mass: {m_opt[-1]:.2f} kg")
         return {
             "success": True,
-            "iters": iterations,
-            "tf_opt": sol.value(tf),
-            "x_opt": sol.value(x),
-            "y_opt": sol.value(y),
-            "vx_opt": sol.value(vx),
-            "vy_opt": sol.value(vy),
-            "m_opt": sol.value(m),
-            "ux_opt": sol.value(ux),
-            "uy_opt": sol.value(uy),
+            "iterations": iterations,
+            "solve_time": t_solve,
+            "tf_opt": sol.value(tf_opt),
+            "x_opt": sol.value(x_opt),
+            "y_opt": sol.value(y_opt),
+            "vx_opt": sol.value(vx_opt),
+            "vy_opt": sol.value(vy_opt),
+            "m_opt": sol.value(m_opt),
+            "ux_opt": sol.value(ux_opt),
+            "uy_opt": sol.value(uy_opt),
         }
     except Exception as e:
         print(f"--- Run failed: {e} ---")
@@ -339,7 +306,6 @@ def plot_single_run(successful_run, N, R):
     Plot the results of a single successful run.
     """
 
-    # Extract solution
     tf_opt = successful_run["tf_opt"]
     x_opt = successful_run["x_opt"]
     y_opt = successful_run["y_opt"]
@@ -352,52 +318,43 @@ def plot_single_run(successful_run, N, R):
     print(f"Optimal time: {tf_opt:.4f} s")
     print(f"Final mass: {m_opt[-1]:.4f} kg")
 
-    # Time vector for plotting
     t = np.linspace(0, tf_opt, N+1)
 
-    # Plot results
-    plt.figure(figsize=(12, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(15, 8))
 
-    plt.subplot(5, 1, 1)
-    plt.plot(t, np.sqrt(x_opt**2 + (y_opt)**2), label='Radial Position')
-    plt.grid(True)
-    plt.xlabel('Time [s]')
-    plt.ylabel('Radial Position [m]')
-    plt.legend()
-    plt.tight_layout()
+    # Position components
+    axes[0, 0].plot(t, x_opt, label='x', linestyle='--')
+    axes[0, 0].plot(t, y_opt - R, label='y - R', linestyle='--')
+    axes[0, 0].plot(t, np.sqrt(x_opt**2 + y_opt**2) - R, 'k', label='r - R')
+    axes[0, 0].set_xlabel('Time [s]')
+    axes[0, 0].set_ylabel('Position [m]')
+    axes[0, 0].grid(True)
+    axes[0, 0].legend()
 
-    plt.subplot(5, 1, 2)
-    plt.plot(t, x_opt, label='x')
-    plt.plot(t, y_opt - R, label='y - R')
-    plt.grid(True)
-    plt.xlabel('Time [s]')
-    plt.ylabel('Position [m]')
-    plt.legend()
+    # Velocity components
+    axes[0, 1].plot(t, vx_opt, label='vx', linestyle='--')
+    axes[0, 1].plot(t, vy_opt, label='vy', linestyle='--')
+    axes[0, 1].plot(t, np.sqrt(vx_opt**2 + vy_opt**2), 'k', label='|v|')
+    axes[0, 1].set_xlabel('Time [s]')
+    axes[0, 1].set_ylabel('Velocity [m/s]')
+    axes[0, 1].grid(True)
+    axes[0, 1].legend()
 
-    plt.subplot(5, 1, 3)
-    plt.plot(t, vx_opt, label='vx')
-    plt.plot(t, vy_opt, label='vy')
-    plt.grid(True)
-    plt.xlabel('Time [s]')
-    plt.ylabel('Velocity [m/s]')
-    plt.legend()
+    # Thrust components
+    axes[1, 0].step(t, ux_opt, where='post', label='ux', linestyle='--')
+    axes[1, 0].step(t, uy_opt, where='post', label='uy', linestyle='--')
+    axes[1, 0].step(t, np.sqrt(ux_opt**2 + uy_opt**2), 'k', where='post', label='|u|')
+    axes[1, 0].set_xlabel('Time [s]')
+    axes[1, 0].set_ylabel('Thrust [N]')
+    axes[1, 0].grid(True)
+    axes[1, 0].legend()
 
-    plt.subplot(5, 1, 4)
-    plt.plot(t, m_opt, label='Mass')
-    plt.grid(True)
-    plt.xlabel('Time [s]')
-    plt.ylabel('Mass [kg]')
-    plt.legend()
-
-    plt.subplot(5, 1, 5)
-    t_control = t[:-1]  # Control points are one fewer than state points
-    plt.step(t_control, ux_opt, label='ux', where='post')
-    plt.step(t_control, uy_opt, label='uy', where='post')
-    plt.step(t_control, np.sqrt(ux_opt**2 + uy_opt**2), label='u_total', where='post')
-    plt.grid(True)
-    plt.xlabel('Time [s]')
-    plt.ylabel('Control [N]')
-    plt.legend()
+    # Mass
+    axes[1, 1].plot(t, m_opt, label='m')
+    axes[1, 1].set_xlabel('Time [s]')
+    axes[1, 1].set_ylabel('Mass [kg]')
+    axes[1, 1].grid(True)
+    axes[1, 1].legend()
 
     plt.tight_layout()
 
@@ -408,7 +365,7 @@ def plot_single_run(successful_run, N, R):
     plt.plot(x_opt[-1], y_opt[-1], 'ro', label='End')
 
     # Draw thrust vectors
-    thrust_scale = 0.001  # Scale factor for visualization
+    thrust_scale = 0.5  # Scale factor for visualization
     for i in range(N):
         # Calculate thrust magnitude
         thrust_magnitude = np.sqrt(ux_opt[i]**2 + uy_opt[i]**2)
@@ -438,13 +395,13 @@ def plot_multiple_runs(successful_runs, N, R):
 
     final_masses = [r["m_opt"][-1] for r in successful_runs]
     final_times = [r["tf_opt"] for r in successful_runs]
-    iters = [r["iters"] for r in successful_runs]
+    iterations = [r["iterations"] for r in successful_runs]
 
     print("\nIterations (successful runs):")
-    print(f"  Min: {int(np.min(iters))}")
-    print(f"  Max: {int(np.max(iters))}")
-    print(f"  Mean: {float(np.mean(iters)):.1f}")
-    print(f"  Standard Deviation: {float(np.std(iters)):.1f}")
+    print(f"  Min: {int(np.min(iterations))}")
+    print(f"  Max: {int(np.max(iterations))}")
+    print(f"  Mean: {float(np.mean(iterations)):.1f}")
+    print(f"  Standard Deviation: {float(np.std(iterations)):.1f}")
 
     print("\nFinal Mass (kg):")
     print(f"  Avg: {np.mean(final_masses):.2f}")
@@ -482,49 +439,80 @@ def plot_multiple_runs(successful_runs, N, R):
 
 def main():
     # Parameters
-    N = 50  # Number of control intervals
-    num_runs = 1 # Number of randomized runs to perform
+    N = 50 # Number of control intervals
+    num_runs = 100 # Number of randomized runs to perform
 
-    G = 6.672e-11  # Gravitational constant
-    M = 5.972e24   # Mass of Earth (kg)
-    R = 6.371e6    # Radius of Earth (m)
-    Isp = 300.0    # Rocket engine specific impulse in seconds
-    g0 = 9.81      # Standard gravity in m/s^2
+    # Physical parameters
+    params = {
+        'G': 6.672e-11, # Gravitational constant (m^3/kg/s^2)
+        'M': 5.972e24, # Mass of Earth (kg)
+        'R': 6.371e6, # Radius of Earth (m)
+        'Isp': 300.0, # Rocket engine specific impulse (s)
+        'g0': 9.81, # Standard gravity (m/s^2)
+        'rho0': 1.225, # Air density at sea level (kg/m^3)
+        'H': 8500.0, # Scale height of atmosphere (m)
+        'Cd': 1.5, # Drag coefficient (assumed)
+        'Aref': 1.0, # Reference area (m^2, assumed)
+    }
 
-    # Atmosphere and aero
-    rho0 = 1.225     # kg/m^3 (sea level)
-    H = 8500.0       # m (scale height)
-    Cd = 1.5         # drag coefficient (assumed)
-    Aref = 1.0       # m^2 reference area (assumed)
-
-    params = [G, M, R, Isp, g0, rho0, H, Cd, Aref]
+    # Scaling factors for non-dimensionalization
+    scales = {
+        'length': params['R'], #  Earth radius
+        'velocity': 1000.0,    # 1000 m/s,
+        'time': 250.0,         # 250 seconds,
+        'mass': 100.0,         # 100 kg,
+        'thrust': 5000.0       # 5 kN
+    }
 
     # Fixed terminal conditions for all runs
-    terminal_conditions = (
-        0.0,    # xf
-        R,      # yf
-        0.0,    # vxf
-        0.0,    # vyf
-        10.0    # mf (minimum allowable final mass)
-    )
+    terminal_conditions = {
+        'xf': 0.0, # Final x-position (m)
+        'yf': params['R'], # Final y-position (m)
+        'vxf': 0.0, # Final x-velocity (m/s)
+        'vyf': 0.0, # Final y-velocity (m/s)
+        'mf': 10.0 # Minimum ALLOWABLE final mass (kg)
+    }
+
+    # Control and time bounds
+    bounds = {
+        'u_min': -5000.0,  # Minimum thrust (N)
+        'u_max': 5000.0,   # Maximum thrust (N)
+        't_min': 1.0,      # Minimum trajectory time (s)
+        't_max': 250.0     # Maximum trajectory time (s)
+    }
+
+    # Position and velocity tolerances for terminal constraints
+    tolerances = {
+        'position_tol': 1.0,    # Position tolerance (m)
+        'velocity_tol': 0.5,    # Velocity tolerance (m/s)
+    }
 
     results = []
     t_start_total = time()
     for i in range(num_runs):
         print(f"--- Starting run {i+1}/{num_runs} ---")
         # Randomized initial conditions
-        initial_conditions = (
-            np.random.uniform(-1000.0, 1000.0), # x0
-            R + np.random.uniform(100.0, 1000.0), # y0
-            np.random.uniform(-250.0, 250.0), # vx0
-            np.random.uniform(-100.0, 0.0), # vy0
-            100.0 # m0
-        )
+        initial_conditions = {
+            'x0': np.random.uniform(-50000.0, 50000.0), # m
+            'y0': params['R'] + np.random.uniform(50000.0, 100000.0), # m
+            'vx0': np.random.uniform(-2500.0, 2500.0), # m/s
+            'vy0': np.random.uniform(-1000.0, 0.0), # m/s
+            'm0': 100.0 # kg
+        }
 
-        result = run_optimization(initial_conditions, terminal_conditions, params, N)
+        # initial_conditions = {
+        #     'x0': -30000.0,      # x0: 30 km downrange
+        #     'y0': R + 75000.0,   # y0: 75 km altitude
+        #     'vx0': 2000.0,        # vx0
+        #     'vy0': -500.0,        # vy0
+        #     'm0': 100.0          # m0
+        # }
+
+        print(f"Initial conditions (run {i+1}): {initial_conditions}")
+
+        result = run_optimization(initial_conditions, terminal_conditions, params, bounds, tolerances, scales, N)
         results.append(result)
     t_end_total = time()
-
 
     print(f"\nFinished {num_runs} runs in {t_end_total - t_start_total:.2f} seconds.")
 
@@ -537,10 +525,9 @@ def main():
     print(f"Successful runs: {num_success} ({num_success/num_runs*100:.1f}%)")
 
     if (num_runs == 1 and num_success == 1):
-        plot_single_run(successful_runs[0], N, R)
+        plot_single_run(successful_runs[0], N, params['R'])
     elif (num_runs > 1 and num_success > 0):
-        plot_multiple_runs(successful_runs, N, R)
-
+        plot_multiple_runs(successful_runs, N, params['R'])
 
 if __name__ == "__main__":
     main()
