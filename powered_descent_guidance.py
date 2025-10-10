@@ -61,10 +61,7 @@ def dynamics(state, control, params, bounds):
     u_max = bounds['u_max']
 
     r = ca.sqrt(x**2 + y**2)
-    # QUESTION: Why does this regularization matter so much for convergence??? Find a better way to handle total thrust (and remove the use of sqrt)
-    u_reg = u_max*1e-3  # N
-    U_total = ca.sqrt(ux**2 + uy**2 + u_reg**2)
-    # U_total = ca.sqrt(ux**2 + uy**2 + u_reg**2) - u_reg
+    U_total = ca.sqrt(ux**2 + uy**2)
 
     dxdt = vx
     dydt = vy
@@ -172,16 +169,12 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     opti.subject_to(opti.bounded(vyf_scaled - velocity_tol_scaled, vy_scaled[-1], vyf_scaled + velocity_tol_scaled))
     opti.subject_to(opti.bounded(t_min_scaled, tf_scaled, t_max_scaled))
 
-    # # Control constraints
-    # opti.subject_to(opti.bounded(u_min_scaled, ux_scaled, u_max_scaled))
-    # opti.subject_to(opti.bounded(u_min_scaled, uy_scaled, u_max_scaled))
-
     # Path constraints
     R_scaled = params['R'] / scales['length']
     opti.subject_to(m_scaled >= mf_scaled)  # Keep mass above dry-mass lower bound everywhere
     opti.subject_to(x_scaled**2 + y_scaled**2 >= R_scaled**2) # Keep vehicle above surface
-    # opti.subject_to(x_scaled**2 + y_scaled**2 >= (0.9*R_scaled)**2) # Keep vehicle above surface
-    opti.subject_to(ux_scaled**2 + uy_scaled**2 <= u_max_scaled**2)  # Thrust magnitude limit
+    opti.subject_to(ux_scaled**2 + uy_scaled**2 >= u_min_scaled**2) # Min thrust magnitude limit
+    opti.subject_to(ux_scaled**2 + uy_scaled**2 <= u_max_scaled**2) # Max thrust magnitude limit
 
     # Mass cannot increase over time
     # NOTE: This constraint really seems to help produce faster convergence and avoid infeasible solutions, why?
@@ -197,9 +190,9 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     # Initial guess for time horizon
     opti.set_initial(tf_scaled, (t_min_scaled + t_max_scaled) / 2.0)
 
-    # Initial guess for states and controls
+    # Initial guess solution: Linear interpolation between boundary conditions for states, min thrust for controls
     for i in range(N+1):
-        # Linear interpolation for states
+        # Linear interpolation initial guess for states
         t_frac = i / N
         opti.set_initial(x_scaled[i], (1-t_frac)*x0_scaled + t_frac*xf_scaled)
         opti.set_initial(y_scaled[i], (1-t_frac)*y0_scaled + t_frac*yf_scaled)
@@ -207,9 +200,9 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
         opti.set_initial(vy_scaled[i], (1-t_frac)*vy0_scaled + t_frac*vyf_scaled)
         opti.set_initial(m_scaled[i], (1-t_frac)*m0_scaled + t_frac*mf_scaled)
 
-        # Zero for controls
-        opti.set_initial(ux_scaled[i], 0.0)
-        opti.set_initial(uy_scaled[i], 0.0)
+        # Min thrust initial guess for controls
+        opti.set_initial(ux_scaled[i], u_min_scaled)
+        opti.set_initial(uy_scaled[i], u_min_scaled)
 
     # Set up solver
     opti.solver('ipopt', {
@@ -468,7 +461,7 @@ def main():
 
     # Control and time bounds
     bounds = {
-        'u_min': -5000.0,  # Minimum thrust (N)
+        'u_min': 1.0,      # Minimum thrust (N)
         'u_max': 5000.0,   # Maximum thrust (N)
         't_min': 1.0,      # Minimum trajectory time (s)
         't_max': 250.0     # Maximum trajectory time (s)
