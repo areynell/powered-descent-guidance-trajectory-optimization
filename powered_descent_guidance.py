@@ -6,73 +6,75 @@
 # 4) Plot midpoints as well
 # 5) Try different collocation methods
 # 6) Move from 2D to 3D
+# 7) Add rotation of planet
 
 import numpy as np
 import casadi as ca
 import matplotlib.pyplot as plt
 from time import time
 
-def dynamics_scaled(state_scaled, control_scaled, params, scales):
+def dynamics_scaled(state_scaled, control_scaled, params, bounds, scales):
     """
-    Compute the dimensionless/scaled dynamics of the system.
+    Scaled dynamics in non-dimensional units.
+    state = [x, y, vx, vy, m] (scaled)
+    control = [ux, uy] (scaled)
+    returns scaled derivatives [dx/dt, dy/dt, dvx/dt, dvy/dt, dm/dt]
+    computed by unscaling the inputs, calling dynamics(), and rescaling the outputs.
     """
+    T = scales['time']
 
-    x_s = state_scaled[0]
-    y_s = state_scaled[1]
-    vx_s = state_scaled[2]
-    vy_s = state_scaled[3]
-    m_s = state_scaled[4]
+    S_x = ca.vertcat(scales['length'],
+                     scales['length'],
+                     scales['velocity'],
+                     scales['velocity'],
+                     scales['mass'])
 
-    ux_s = control_scaled[0]
-    uy_s = control_scaled[1]
+    S_u = ca.vertcat(scales['thrust'],
+                     scales['thrust'])
 
-    # Unpack parameters
+    x_scaled = state_scaled
+    u_scaled = control_scaled
+
+    return (T / S_x) * dynamics(S_x*x_scaled, S_u*u_scaled, params, bounds)
+
+def dynamics(state, control, params, bounds):
+    """
+    Unscaled dynamics in physical units.
+    state = [x, y, vx, vy, m]
+    control = [ux, uy]
+    returns derivatives [dx/dt, dy/dt, dvx/dt, dvy/dt, dm/dt]
+    """
+    x = state[0]
+    y = state[1]
+    vx = state[2]
+    vy = state[3]
+    m = state[4]
+
+    ux = control[0]
+    uy = control[1]
+
     G = params['G']
     M = params['M']
     Isp = params['Isp']
     g0 = params['g0']
 
-    # Unpack scales
-    length_scale = scales['length']
-    velocity_scale = scales['velocity']
-    time_scale = scales['time']
-    mass_scale = scales['mass']
-    thrust_scale = scales['thrust']
+    u_max = bounds['u_max']
 
-    # Example derivation of dimensionless scale factors for dvx/dt:
-    # --------------------------------------------------------------
-    # LHS: dvx/dt = d(velocity_scale * vx_s) / d(time_scale * t_s) = (velocity_scale/time_scale) * dvx_s/dt_s
-    # RHS: -G*M*x/r^3 + ux/m = -G*M*(length_scale*x_s)/sqrt((length_scale*x_s)^2 + (length_scale*y_s)^2)^3 + (thrust_scale*ux_s)/(mass_scale*m_s)
-    # RHS: -G*M*x/r^3 + ux/m = -G*M*(length_scale*x_s)/(length_scale^3*sqrt(x_s^2 + y_s^2)^3) + (thrust_scale/mass_scale)*(ux_s/m_s)
-    # RHS: -G*M*x/r^3 + ux/m = -(1/length_scale^2)*G*M*x_s/r_s^3 + (thrust_scale/mass_scale)*(ux_s/m_s)
-    # Therefore, we have
-    # (velocity_scale/time_scale) * dvx_s/dt_s = - (1/length_scale^2)*G*M*x_s/r_s^3 + (thrust_scale/mass_scale)*(ux_s/m_s)
-    # Rearranging, we get:
-    # dvx_s/dt_s = -(time_scale/(velocity_scale*length_scale^2))*G*M*x_s/r_s^3 + ((thrust_scale*time_scale)/(mass_scale*velocity_scale))*(ux_s/m_s)
+    r = ca.sqrt(x**2 + y**2)
+    # QUESTION: Why does this regularization matter so much for convergence??? Find a better way to handle total thrust (and remove the use of sqrt)
+    u_reg = u_max*1e-3  # N
+    U_total = ca.sqrt(ux**2 + uy**2 + u_reg**2)
+    # U_total = ca.sqrt(ux**2 + uy**2 + u_reg**2) - u_reg
 
-    # Dimensionless scale factors
-    alpha = (velocity_scale * time_scale) / length_scale                # Position scale factor
-    beta = time_scale / (velocity_scale * length_scale**2)              # Velocity scale factor
-    gamma = (thrust_scale * time_scale) / (mass_scale * velocity_scale) # Mass scale factor
-    kappa = (thrust_scale * time_scale) / mass_scale                    # Control scale factor
+    dxdt = vx
+    dydt = vy
+    dvxdt = -G * M * (x / r**3) + ux / m
+    dvydt = -G * M * (y / r**3) + uy / m
+    dmdt = -U_total / (Isp * g0)
 
-    # TODO: Find a better way to handle the singularity at u=0, since convergence seems very reliant on eps_thrust value
-    # eps_thrust_s = 1e-3 / thrust_scale
-    eps_thrust_s = 1.0e-3
-    r_s = ca.sqrt(x_s**2 + y_s**2) # Distance from center of planet
-    T_s = ca.sqrt(ux_s**2 + uy_s**2 + eps_thrust_s**2)  # Thrust magnitude
-    mu_s = beta * G * M # Scaled gravitational parameter
+    return ca.vertcat(dxdt, dydt, dvxdt, dvydt, dmdt)
 
-    # Equations of motion
-    dx_s_dt_s = alpha * vx_s
-    dy_s_dt_s = alpha * vy_s
-    dvx_s_dt_s = -mu_s * (x_s/r_s**3) + gamma * (ux_s / m_s)
-    dvy_s_dt_s = -mu_s * (y_s/r_s**3) + gamma * (uy_s / m_s)
-    dm_s_dt_s = -kappa*T_s/(Isp*g0)
-
-    return ca.vertcat(dx_s_dt_s, dy_s_dt_s, dvx_s_dt_s, dvy_s_dt_s, dm_s_dt_s)
-
-def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, scales, N):
+def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, bounds, scales, N):
     """
     Add dynamic constraints using Hermite-Simpson collocation.
     """
@@ -84,8 +86,8 @@ def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled,
         uk_next = U_scaled[:, k+1]
 
         # Dynamics at beginning and end of interval
-        fk = dynamics_scaled(xk, uk, params, scales)
-        fk_next = dynamics_scaled(xk_next, uk_next, params, scales)
+        fk = dynamics_scaled(xk, uk, params, bounds, scales)
+        fk_next = dynamics_scaled(xk_next, uk_next, params, bounds, scales)
 
         # Midpoint state (Hermite interpolation)
         xk_mid = 0.5 * (xk + xk_next) + (dt_scaled/8.0) * (fk - fk_next)
@@ -94,7 +96,7 @@ def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled,
         uk_mid = 0.5 * (uk + uk_next)
 
         # Dynamics at midpoint
-        fk_mid = dynamics_scaled(xk_mid, uk_mid, params, scales)
+        fk_mid = dynamics_scaled(xk_mid, uk_mid, params, bounds, scales)
 
         # Simpson integration
         opti.subject_to(xk_next == xk + (dt_scaled/6.0) * (fk + 4.0*fk_mid + fk_next))
@@ -187,7 +189,7 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
         opti.subject_to(m_scaled[k+1] <= m_scaled[k])
 
     # Dynamic equality constraints
-    add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, scales, N)
+    add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, bounds, scales, N)
 
     # Objective function: Maximize final mass (by minimizing fuel use)
     opti.minimize(-m_scaled[-1])
@@ -213,7 +215,7 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     opti.solver('ipopt', {
         'ipopt.print_level': 5,
         'expand': True,
-        'ipopt.max_iter': 5000,
+        'ipopt.max_iter': 500,
         'ipopt.tol': 1e-6,
         "ipopt.linear_solver": "mumps",
     })
@@ -440,7 +442,7 @@ def plot_multiple_runs(successful_runs, N, R):
 def main():
     # Parameters
     N = 50 # Number of control intervals
-    num_runs = 100 # Number of randomized runs to perform
+    num_runs = 1 # Number of randomized runs to perform
 
     # Physical parameters
     params = {
@@ -453,15 +455,6 @@ def main():
         'H': 8500.0, # Scale height of atmosphere (m)
         'Cd': 1.5, # Drag coefficient (assumed)
         'Aref': 1.0, # Reference area (m^2, assumed)
-    }
-
-    # Scaling factors for non-dimensionalization
-    scales = {
-        'length': params['R'], #  Earth radius
-        'velocity': 1000.0,    # 1000 m/s,
-        'time': 250.0,         # 250 seconds,
-        'mass': 100.0,         # 100 kg,
-        'thrust': 5000.0       # 5 kN
     }
 
     # Fixed terminal conditions for all runs
@@ -491,22 +484,31 @@ def main():
     t_start_total = time()
     for i in range(num_runs):
         print(f"--- Starting run {i+1}/{num_runs} ---")
-        # Randomized initial conditions
+        # # Randomized initial conditions
+        # initial_conditions = {
+        #     'x0': np.random.uniform(-50000.0, 50000.0), # m
+        #     'y0': params['R'] + np.random.uniform(50000.0, 100000.0), # m
+        #     'vx0': np.random.uniform(-2500.0, 2500.0), # m/s
+        #     'vy0': np.random.uniform(-1000.0, 0.0), # m/s
+        #     'm0': 100.0 # kg
+        # }
+
         initial_conditions = {
-            'x0': np.random.uniform(-50000.0, 50000.0), # m
-            'y0': params['R'] + np.random.uniform(50000.0, 100000.0), # m
-            'vx0': np.random.uniform(-2500.0, 2500.0), # m/s
-            'vy0': np.random.uniform(-1000.0, 0.0), # m/s
-            'm0': 100.0 # kg
+            'x0': -30000.0,      # x0: 30 km downrange
+            'y0': params['R'] + 75000.0,   # y0: 75 km altitude
+            'vx0': 2000.0,        # vx0
+            'vy0': -500.0,        # vy0
+            'm0': 100.0          # m0
         }
 
-        # initial_conditions = {
-        #     'x0': -30000.0,      # x0: 30 km downrange
-        #     'y0': R + 75000.0,   # y0: 75 km altitude
-        #     'vx0': 2000.0,        # vx0
-        #     'vy0': -500.0,        # vy0
-        #     'm0': 100.0          # m0
-        # }
+        # Scaling factors for non-dimensionalization
+        scales = {
+            'length': params['R'], #  Earth radius
+            'velocity': 1000.0,    # 1000 m/s,
+            'mass': 100.0,         # 100 kg,
+            'thrust': 5000.0,      # 5 kN
+            'time': 250.0          # 250 seconds,
+        }
 
         print(f"Initial conditions (run {i+1}): {initial_conditions}")
 
