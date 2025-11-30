@@ -184,12 +184,6 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     # Dynamic equality constraints
     add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, bounds, scales, N)
 
-    # Objective function: Maximize final mass (by minimizing fuel use)
-    opti.minimize(-m_scaled[-1])
-
-    # Initial guess for time horizon
-    opti.set_initial(tf_scaled, (t_min_scaled + t_max_scaled) / 2.0)
-
     # Initial guess solution: Linear interpolation between boundary conditions for states, min thrust for controls
     for i in range(N+1):
         # Linear interpolation initial guess for states
@@ -203,6 +197,13 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
         # Min thrust initial guess for controls
         opti.set_initial(ux_scaled[i], u_min_scaled)
         opti.set_initial(uy_scaled[i], u_min_scaled)
+
+    # Initial guess for time horizon
+    opti.set_initial(tf_scaled, (t_min_scaled + t_max_scaled) / 2.0)
+
+    # Objective function: Maximize final mass (by minimizing fuel use) AND minimize slack
+    # NOTE: Using slack variables on position and velocity seemed to worsen convergence. Better to use tolerances on terminal constraints.
+    opti.minimize(-m_scaled[-1])
 
     # Set up solver
     opti.solver('ipopt', {
@@ -435,7 +436,7 @@ def plot_multiple_runs(successful_runs, N, R):
 def main():
     # Parameters
     N = 50 # Number of control intervals
-    num_runs = 1 # Number of randomized runs to perform
+    num_runs = 1000 # Number of randomized runs to perform
 
     # Physical parameters
     params = {
@@ -474,6 +475,7 @@ def main():
     }
 
     results = []
+    failed_initial_conditions = []
     t_start_total = time()
     for i in range(num_runs):
         print(f"--- Starting run {i+1}/{num_runs} ---")
@@ -507,6 +509,9 @@ def main():
 
         result = run_optimization(initial_conditions, terminal_conditions, params, bounds, tolerances, scales, N)
         results.append(result)
+        if not result['success']:
+            failed_initial_conditions.append(initial_conditions)
+
     t_end_total = time()
 
     print(f"\nFinished {num_runs} runs in {t_end_total - t_start_total:.2f} seconds.")
@@ -518,6 +523,11 @@ def main():
     print("\n--- Overall Summary ---")
     print(f"Total runs attempted: {num_runs}")
     print(f"Successful runs: {num_success} ({num_success/num_runs*100:.1f}%)")
+
+    if failed_initial_conditions:
+        print("\n--- Failed Initial Conditions ---")
+        for initial_condition in failed_initial_conditions:
+            print(initial_condition)
 
     if (num_runs == 1 and num_success == 1):
         plot_single_run(successful_runs[0], N, params['R'])
