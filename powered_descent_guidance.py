@@ -7,13 +7,14 @@
 # 5) Try different collocation methods
 # 6) Move from 2D to 3D
 # 7) Add rotation of planet
+# 8) Re-order functions to make reading flow easier
 
 import numpy as np
 import casadi as ca
 import matplotlib.pyplot as plt
 from time import time
 
-def dynamics_scaled(state_scaled, control_scaled, params, bounds, scales):
+def dynamics_scaled(state_scaled, control_scaled, params, bounds, scale_factors, offsets):
     """
     Scaled dynamics in non-dimensional units.
     state = [x, y, vx, vy, m] (scaled)
@@ -21,23 +22,30 @@ def dynamics_scaled(state_scaled, control_scaled, params, bounds, scales):
     returns scaled derivatives [dx/dt, dy/dt, dvx/dt, dvy/dt, dm/dt]
     computed by unscaling the inputs, calling dynamics(), and rescaling the outputs.
     """
-    T = scales['time']
+    T = scale_factors['t']
+    S_x = ca.vertcat(scale_factors['x'],
+                     scale_factors['y'],
+                     scale_factors['vx'],
+                     scale_factors['vy'],
+                     scale_factors['m'])
+    S_u = ca.vertcat(scale_factors['ux'],
+                     scale_factors['uy'])
 
-    S_x = ca.vertcat(scales['length'],
-                     scales['length'],
-                     scales['velocity'],
-                     scales['velocity'],
-                     scales['mass'])
-
-    S_u = ca.vertcat(scales['thrust'],
-                     scales['thrust'])
+    x_offsets = ca.vertcat(offsets['x'],
+                           offsets['y'],
+                           offsets['vx'],
+                           offsets['vy'],
+                           offsets['m'])
+    u_offsets = ca.vertcat(offsets['ux'],
+                           offsets['uy'])
 
     x_scaled = state_scaled
     u_scaled = control_scaled
 
-    return (T / S_x) * dynamics(S_x*x_scaled, S_u*u_scaled, params, bounds)
 
-def dynamics(state, control, params, bounds):
+    return (T / S_x) * dynamics(S_x*x_scaled + x_offsets, S_u*u_scaled + u_offsets, params)
+
+def dynamics(state, control, params):
     """
     Unscaled dynamics in physical units.
     state = [x, y, vx, vy, m]
@@ -58,8 +66,6 @@ def dynamics(state, control, params, bounds):
     Isp = params['Isp']
     g0 = params['g0']
 
-    u_max = bounds['u_max']
-
     r = ca.sqrt(x**2 + y**2)
     U_total = ca.sqrt(ux**2 + uy**2)
 
@@ -71,7 +77,7 @@ def dynamics(state, control, params, bounds):
 
     return ca.vertcat(dxdt, dydt, dvxdt, dvydt, dmdt)
 
-def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, bounds, scales, N):
+def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, bounds, scale_factors, offsets, N):
     """
     Add dynamic constraints using Hermite-Simpson collocation.
     """
@@ -83,8 +89,8 @@ def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled,
         uk_next = U_scaled[:, k+1]
 
         # Dynamics at beginning and end of interval
-        fk = dynamics_scaled(xk, uk, params, bounds, scales)
-        fk_next = dynamics_scaled(xk_next, uk_next, params, bounds, scales)
+        fk = dynamics_scaled(xk, uk, params, bounds, scale_factors, offsets)
+        fk_next = dynamics_scaled(xk_next, uk_next, params, bounds, scale_factors, offsets)
 
         # Midpoint state (Hermite interpolation)
         xk_mid = 0.5 * (xk + xk_next) + (dt_scaled/8.0) * (fk - fk_next)
@@ -93,12 +99,12 @@ def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled,
         uk_mid = 0.5 * (uk + uk_next)
 
         # Dynamics at midpoint
-        fk_mid = dynamics_scaled(xk_mid, uk_mid, params, bounds, scales)
+        fk_mid = dynamics_scaled(xk_mid, uk_mid, params, bounds, scale_factors, offsets)
 
         # Simpson integration
         opti.subject_to(xk_next == xk + (dt_scaled/6.0) * (fk + 4.0*fk_mid + fk_next))
 
-def run_optimization(initial_conditions, terminal_conditions, params, bounds, tolerances, scales, N):
+def run_optimization(initial_conditions, terminal_conditions, params, bounds, tolerances, scale_factors, offsets, N):
     """
     Set up the objective function and constraints, and solve a single trajectory optimization problem.
     """
@@ -108,30 +114,32 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     num_controls = 2  # [ux, uy]
 
     # Scaled initial conditions
-    x0_scaled = initial_conditions['x0'] / scales['length']
-    y0_scaled = initial_conditions['y0'] / scales['length']
-    vx0_scaled = initial_conditions['vx0'] / scales['velocity']
-    vy0_scaled = initial_conditions['vy0'] / scales['velocity']
-    m0_scaled = initial_conditions['m0'] / scales['mass']
+    x0_scaled = (initial_conditions['x0'] - offsets['x']) / scale_factors['x']
+    y0_scaled = (initial_conditions['y0'] - offsets['y']) / scale_factors['y']
+    vx0_scaled = (initial_conditions['vx0'] - offsets['vx']) / scale_factors['vx']
+    vy0_scaled = (initial_conditions['vy0'] - offsets['vy']) / scale_factors['vy']
+    m0_scaled = (initial_conditions['m0'] - offsets['m']) / scale_factors['m']
 
     # Scaled terminal conditions
-    xf_scaled = terminal_conditions['xf'] / scales['length']
-    yf_scaled = terminal_conditions['yf'] / scales['length']
-    vxf_scaled = terminal_conditions['vxf'] / scales['velocity']
-    vyf_scaled = terminal_conditions['vyf'] / scales['velocity']
-    mf_scaled = terminal_conditions['mf'] / scales['mass']
+    xf_scaled = (terminal_conditions['xf'] - offsets['x']) / scale_factors['x']
+    yf_scaled = (terminal_conditions['yf'] - offsets['y']) / scale_factors['y']
+    vxf_scaled = (terminal_conditions['vxf'] - offsets['vx']) / scale_factors['vx']
+    vyf_scaled = (terminal_conditions['vyf'] - offsets['vy']) / scale_factors['vy']
+    mf_scaled = (terminal_conditions['mf'] - offsets['m']) / scale_factors['m']
 
     # Scaled control bounds
-    u_min_scaled = bounds['u_min'] / scales['thrust']
-    u_max_scaled = bounds['u_max'] / scales['thrust']
+    u_min_scaled = bounds['u_min'] / scale_factors['ux']
+    u_max_scaled = bounds['u_max'] / scale_factors['uy']
 
     # Scaled time horizon bounds
-    t_min_scaled = bounds['t_min'] / scales['time']
-    t_max_scaled = bounds['t_max'] / scales['time']
+    t_min_scaled = bounds['t_min'] / scale_factors['t']
+    t_max_scaled = bounds['t_max'] / scale_factors['t']
 
     # Scaled position and velocity tolerances for terminal constraints
-    position_tol_scaled = tolerances['position_tol'] / scales['length']
-    velocity_tol_scaled = tolerances['velocity_tol'] / scales['velocity']
+    x_tol_scaled = tolerances['x_tol'] / scale_factors['x']
+    y_tol_scaled = tolerances['y_tol'] / scale_factors['y']
+    vx_tol_scaled = tolerances['vx_tol'] / scale_factors['vx']
+    vy_tol_scaled = tolerances['vy_tol'] / scale_factors['vy']
 
     # Optimization variables
     opti = ca.Opti()
@@ -163,26 +171,34 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     opti.subject_to(m_scaled[0] == m0_scaled)
 
     # Final constraints
-    opti.subject_to(opti.bounded(xf_scaled - position_tol_scaled, x_scaled[-1], xf_scaled + position_tol_scaled))
-    opti.subject_to(opti.bounded(yf_scaled - position_tol_scaled, y_scaled[-1], yf_scaled + position_tol_scaled))
-    opti.subject_to(opti.bounded(vxf_scaled - velocity_tol_scaled, vx_scaled[-1], vxf_scaled + velocity_tol_scaled))
-    opti.subject_to(opti.bounded(vyf_scaled - velocity_tol_scaled, vy_scaled[-1], vyf_scaled + velocity_tol_scaled))
+    opti.subject_to(opti.bounded(xf_scaled - x_tol_scaled, x_scaled[-1], xf_scaled + x_tol_scaled))
+    opti.subject_to(opti.bounded(yf_scaled - y_tol_scaled, y_scaled[-1], yf_scaled + y_tol_scaled))
+    opti.subject_to(opti.bounded(vxf_scaled - vx_tol_scaled, vx_scaled[-1], vxf_scaled + vx_tol_scaled))
+    opti.subject_to(opti.bounded(vyf_scaled - vy_tol_scaled, vy_scaled[-1], vyf_scaled + vy_tol_scaled))
     opti.subject_to(opti.bounded(t_min_scaled, tf_scaled, t_max_scaled))
 
     # Path constraints
-    R_scaled = params['R'] / scales['length']
-    opti.subject_to(m_scaled >= mf_scaled)  # Keep mass above dry-mass lower bound everywhere
-    opti.subject_to(x_scaled**2 + y_scaled**2 >= R_scaled**2) # Keep vehicle above surface
+    # Surface constraint (Spherical Earth)
+    # Keep vehicle above surface (r >= R), using physical units since x and y scales might differ
+    x_phys = x_scaled * scale_factors['x'] + offsets['x']
+    y_phys = y_scaled * scale_factors['y'] + offsets['y']
+    # IMPORTANT: Normalizing by R to keep gradients well-scaled (r >= R => r/R >= 1)
+    opti.subject_to(ca.sqrt(x_phys**2 + y_phys**2) / params['R'] >= 1.0)
+    # opti.subject_to((x_phys**2 + y_phys**2) / params['R']**2 >= 1.0)
+
+    # Thrust magnitude constraints
     opti.subject_to(ux_scaled**2 + uy_scaled**2 >= u_min_scaled**2) # Min thrust magnitude limit
     opti.subject_to(ux_scaled**2 + uy_scaled**2 <= u_max_scaled**2) # Max thrust magnitude limit
 
-    # Mass cannot increase over time
+    # Mass constraints
+    opti.subject_to(m_scaled >= mf_scaled)  # Keep mass above dry-mass lower bound everywhere
     # NOTE: This constraint really seems to help produce faster convergence and avoid infeasible solutions, why?
     for k in range(N):
+        # Mass cannot increase over time
         opti.subject_to(m_scaled[k+1] <= m_scaled[k])
 
     # Dynamic equality constraints
-    add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, bounds, scales, N)
+    add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, bounds, scale_factors, offsets, N)
 
     # Initial guess solution: Linear interpolation between boundary conditions for states, min thrust for controls
     for i in range(N+1):
@@ -211,7 +227,7 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
         'expand': True,
         'ipopt.max_iter': 500,
         'ipopt.tol': 1e-6,
-        "ipopt.linear_solver": "mumps",
+        'ipopt.nlp_scaling_method': 'gradient-based',
     })
 
     try:
@@ -266,15 +282,21 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
         # plt.tight_layout()
         # plt.show()
 
+        print("Min scaled state magnitudes:", np.min(sol.value(X_scaled), axis=1))
+        print("Max scaled state magnitudes:", np.max(sol.value(X_scaled), axis=1))
+        print("Min scaled control magnitudes:", np.min(sol.value(U_scaled), axis=1))
+        print("Max scaled control magnitudes:", np.max(sol.value(U_scaled), axis=1))
+        print("Final scaled time:", sol.value(tf_scaled))
+
         # Extract and unscale solution
-        tf_opt = sol.value(tf_scaled) * scales['time']
-        x_opt = sol.value(x_scaled) * scales['length']
-        y_opt = sol.value(y_scaled) * scales['length']
-        vx_opt = sol.value(vx_scaled) * scales['velocity']
-        vy_opt = sol.value(vy_scaled) * scales['velocity']
-        m_opt = sol.value(m_scaled) * scales['mass']
-        ux_opt = sol.value(ux_scaled) * scales['thrust']
-        uy_opt = sol.value(uy_scaled) * scales['thrust']
+        tf_opt = sol.value(tf_scaled) * scale_factors['t'] + offsets['t']
+        x_opt = sol.value(x_scaled) * scale_factors['x'] + offsets['x']
+        y_opt = sol.value(y_scaled) * scale_factors['y'] + offsets['y']
+        vx_opt = sol.value(vx_scaled) * scale_factors['vx'] + offsets['vx']
+        vy_opt = sol.value(vy_scaled) * scale_factors['vy'] + offsets['vy']
+        m_opt = sol.value(m_scaled) * scale_factors['m'] + offsets['m']
+        ux_opt = sol.value(ux_scaled) * scale_factors['ux'] + offsets['ux']
+        uy_opt = sol.value(uy_scaled) * scale_factors['uy'] + offsets['uy']
 
         print(f"--- Run succeeded ---")
         print(f"Converged in {iterations} iterations ({t_solve:.2f} seconds)")
@@ -321,7 +343,7 @@ def plot_single_run(successful_run, N, R):
     # Position components
     axes[0, 0].plot(t, x_opt, label='x', linestyle='--')
     axes[0, 0].plot(t, y_opt - R, label='y - R', linestyle='--')
-    axes[0, 0].plot(t, np.sqrt(x_opt**2 + y_opt**2) - R, 'k', label='r - R')
+    axes[0, 0].plot(t, np.sqrt(x_opt**2 + y_opt**2) - R, label='r - R', color='k')
     axes[0, 0].set_xlabel('Time [s]')
     axes[0, 0].set_ylabel('Position [m]')
     axes[0, 0].grid(True)
@@ -330,23 +352,23 @@ def plot_single_run(successful_run, N, R):
     # Velocity components
     axes[0, 1].plot(t, vx_opt, label='vx', linestyle='--')
     axes[0, 1].plot(t, vy_opt, label='vy', linestyle='--')
-    axes[0, 1].plot(t, np.sqrt(vx_opt**2 + vy_opt**2), 'k', label='|v|')
+    axes[0, 1].plot(t, np.sqrt(vx_opt**2 + vy_opt**2), label='|v|', color='k')
     axes[0, 1].set_xlabel('Time [s]')
     axes[0, 1].set_ylabel('Velocity [m/s]')
     axes[0, 1].grid(True)
     axes[0, 1].legend()
 
     # Thrust components
-    axes[1, 0].step(t, ux_opt, where='post', label='ux', linestyle='--')
-    axes[1, 0].step(t, uy_opt, where='post', label='uy', linestyle='--')
-    axes[1, 0].step(t, np.sqrt(ux_opt**2 + uy_opt**2), 'k', where='post', label='|u|')
+    axes[1, 0].step(t, ux_opt, label='ux', linestyle='--')
+    axes[1, 0].step(t, uy_opt, label='uy', linestyle='--')
+    axes[1, 0].step(t, np.sqrt(ux_opt**2 + uy_opt**2), label='|u|', color='k')
     axes[1, 0].set_xlabel('Time [s]')
     axes[1, 0].set_ylabel('Thrust [N]')
     axes[1, 0].grid(True)
     axes[1, 0].legend()
 
     # Mass
-    axes[1, 1].plot(t, m_opt, label='m')
+    axes[1, 1].plot(t, m_opt, label='m', color='k')
     axes[1, 1].set_xlabel('Time [s]')
     axes[1, 1].set_ylabel('Mass [kg]')
     axes[1, 1].grid(True)
@@ -436,7 +458,7 @@ def plot_multiple_runs(successful_runs, N, R):
 def main():
     # Parameters
     N = 50 # Number of control intervals
-    num_runs = 1000 # Number of randomized runs to perform
+    num_runs = 1 # Number of randomized runs to perform
 
     # Physical parameters
     params = {
@@ -470,13 +492,16 @@ def main():
 
     # Position and velocity tolerances for terminal constraints
     tolerances = {
-        'position_tol': 1.0,    # Position tolerance (m)
-        'velocity_tol': 0.5,    # Velocity tolerance (m/s)
+        'x_tol': 1.0,    # Position tolerance (m)
+        'y_tol': 1.0,    # Position tolerance (m)
+        'vx_tol': 0.5,    # Velocity tolerance (m/s)
+        'vy_tol': 0.5,    # Velocity tolerance (m/s)
     }
 
     results = []
     failed_initial_conditions = []
     t_start_total = time()
+    np.random.seed(0)
     for i in range(num_runs):
         print(f"--- Starting run {i+1}/{num_runs} ---")
         # # Randomized initial conditions
@@ -489,25 +514,40 @@ def main():
         # }
 
         initial_conditions = {
-            'x0': -30000.0,      # x0: 30 km downrange
-            'y0': params['R'] + 75000.0,   # y0: 75 km altitude
-            'vx0': 2000.0,        # vx0
-            'vy0': -500.0,        # vy0
-            'm0': 100.0          # m0
+            'x0': -30000.0,              # x0: 30 km downrange
+            'y0': params['R'] + 75000.0, # y0: 75 km altitude
+            'vx0': 2000.0,               # vx0
+            'vy0': -500.0,               # vy0
+            'm0': 100.0                  # m0
         }
 
         # Scaling factors for non-dimensionalization
-        scales = {
-            'length': params['R'], #  Earth radius
-            'velocity': 1000.0,    # 1000 m/s,
-            'mass': 100.0,         # 100 kg,
-            'thrust': 5000.0,      # 5 kN
-            'time': 250.0          # 250 seconds,
+        scale_factors = {
+            'x': params['R'],
+            'y': params['R'],
+            'vx': 1000.0,     # 1000 m/s
+            'vy': 1000.0,     # 1000 m/s
+            'm': 100.0,       # 100 kg,
+            'ux': 5000.0,     # 5 kN
+            'uy': 5000.0,     # 5 kN
+            't': 250.0        # 250 seconds,
+        }
+
+        # Offsets for non-dimensionalization
+        offsets = {
+            'x': 0.0,
+            'y': 0.0,
+            'vx': 0.0,
+            'vy': 0.0,
+            'm': 0.0,
+            'ux': 0.0,
+            'uy': 0.0,
+            't': 0.0
         }
 
         print(f"Initial conditions (run {i+1}): {initial_conditions}")
 
-        result = run_optimization(initial_conditions, terminal_conditions, params, bounds, tolerances, scales, N)
+        result = run_optimization(initial_conditions, terminal_conditions, params, bounds, tolerances, scale_factors, offsets, N)
         results.append(result)
         if not result['success']:
             failed_initial_conditions.append(initial_conditions)
@@ -535,4 +575,5 @@ def main():
         plot_multiple_runs(successful_runs, N, params['R'])
 
 if __name__ == "__main__":
+    np.set_printoptions(suppress=True, precision=10)
     main()
