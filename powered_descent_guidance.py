@@ -163,6 +163,9 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     # NOTE: Is there a better way we can incorporate a free final time? "tdot = 1" or "time scaling"?
     dt_scaled = tf_scaled / N
 
+    # Slack variable for surface constraint
+    slack_surface = opti.variable(1, N+1)
+
     # Initial constraints
     opti.subject_to(x_scaled[0] == x0_scaled)
     opti.subject_to(y_scaled[0] == y0_scaled)
@@ -178,13 +181,12 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     opti.subject_to(opti.bounded(t_min_scaled, tf_scaled, t_max_scaled))
 
     # Path constraints
-    # Surface constraint (Spherical Earth)
     # Keep vehicle above surface (r >= R), using physical units since x and y scales might differ
     x_phys = x_scaled * scale_factors['x'] + offsets['x']
     y_phys = y_scaled * scale_factors['y'] + offsets['y']
-    # IMPORTANT: Normalizing by R to keep gradients well-scaled (r >= R => r/R >= 1)
-    opti.subject_to(ca.sqrt(x_phys**2 + y_phys**2) / params['R'] >= 1.0)
-    # opti.subject_to((x_phys**2 + y_phys**2) / params['R']**2 >= 1.0)
+    # IMPORTANT: Normalizing by R to keep gradients well-scaled (r >= R => r/R >= 1), and using slack variable to improve convergence
+    opti.subject_to(slack_surface >= 0)
+    opti.subject_to(ca.sqrt(x_phys**2 + y_phys**2) / params['R'] >= 1.0 - slack_surface)
 
     # Thrust magnitude constraints
     opti.subject_to(ux_scaled**2 + uy_scaled**2 >= u_min_scaled**2) # Min thrust magnitude limit
@@ -214,12 +216,16 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
         opti.set_initial(ux_scaled[i], u_min_scaled)
         opti.set_initial(uy_scaled[i], u_min_scaled)
 
+    # Initialize slack on surface constraint to zero
+    opti.set_initial(slack_surface, 0.0)
+
     # Initial guess for time horizon
     opti.set_initial(tf_scaled, (t_min_scaled + t_max_scaled) / 2.0)
 
     # Objective function: Maximize final mass (by minimizing fuel use) AND minimize slack
     # NOTE: Using slack variables on position and velocity seemed to worsen convergence. Better to use tolerances on terminal constraints.
-    opti.minimize(-m_scaled[-1])
+    surface_slack_penalty = 1e6
+    opti.minimize(-m_scaled[-1] + surface_slack_penalty * ca.sumsqr(slack_surface))
 
     # Set up solver
     opti.solver('ipopt', {
@@ -458,7 +464,7 @@ def plot_multiple_runs(successful_runs, N, R):
 def main():
     # Parameters
     N = 50 # Number of control intervals
-    num_runs = 1 # Number of randomized runs to perform
+    num_runs = 100 # Number of randomized runs to perform
 
     # Physical parameters
     params = {
@@ -504,22 +510,22 @@ def main():
     np.random.seed(0)
     for i in range(num_runs):
         print(f"--- Starting run {i+1}/{num_runs} ---")
-        # # Randomized initial conditions
-        # initial_conditions = {
-        #     'x0': np.random.uniform(-50000.0, 50000.0), # m
-        #     'y0': params['R'] + np.random.uniform(50000.0, 100000.0), # m
-        #     'vx0': np.random.uniform(-2500.0, 2500.0), # m/s
-        #     'vy0': np.random.uniform(-1000.0, 0.0), # m/s
-        #     'm0': 100.0 # kg
-        # }
-
+        # Randomized initial conditions
         initial_conditions = {
-            'x0': -30000.0,              # x0: 30 km downrange
-            'y0': params['R'] + 75000.0, # y0: 75 km altitude
-            'vx0': 2000.0,               # vx0
-            'vy0': -500.0,               # vy0
-            'm0': 100.0                  # m0
+            'x0': np.random.uniform(-50000.0, 50000.0), # m
+            'y0': params['R'] + np.random.uniform(50000.0, 100000.0), # m
+            'vx0': np.random.uniform(-2500.0, 2500.0), # m/s
+            'vy0': np.random.uniform(-1000.0, 0.0), # m/s
+            'm0': 100.0 # kg
         }
+
+        # initial_conditions = {
+        #     'x0': -30000.0,              # x0: 30 km downrange
+        #     'y0': params['R'] + 75000.0, # y0: 75 km altitude
+        #     'vx0': 2000.0,               # vx0
+        #     'vy0': -500.0,               # vy0
+        #     'm0': 100.0                  # m0
+        # }
 
         # Scaling factors for non-dimensionalization
         scale_factors = {
