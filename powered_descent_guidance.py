@@ -5,14 +5,38 @@
 # 3) Use polynomial trajectories for state and controls that match collocation method
 # 4) Plot midpoints as well
 # 5) Try different collocation methods
-# 6) Move from 2D to 3D
-# 7) Add rotation of planet
-# 8) Re-order functions to make reading flow easier
+# 6) Add rotation of planet
+# 7) Re-order functions to make reading flow easier
 
 import numpy as np
 import casadi as ca
 import matplotlib.pyplot as plt
 from time import time
+
+import trajectory_validation as traj_val
+
+# TODO: Generalize dynamics function to accept both CasADi and NumPy inputs
+def dynamics_np(state, control, params):
+    x, y, z, vx, vy, vz, m = state
+    ux, uy, uz = control
+
+    G = params['G']
+    M = params['M']
+    Isp = params['Isp']
+    g0 = params['g0']
+
+    r = np.sqrt(x**2 + y**2 + z**2)
+    u_total = np.sqrt(ux**2 + uy**2 + uz**2)
+
+    dxdt = vx
+    dydt = vy
+    dzdt = vz
+    dvxdt = -G * M * (x / r**3) + ux / m
+    dvydt = -G * M * (y / r**3) + uy / m
+    dvzdt = -G * M * (z / r**3) + uz / m
+    dmdt = -u_total / (Isp * g0)
+
+    return np.array([dxdt, dydt, dzdt, dvxdt, dvydt, dvzdt, dmdt])
 
 def dynamics_scaled(state_scaled, control_scaled, params, bounds, scale_factors, offsets):
     """
@@ -47,7 +71,6 @@ def dynamics_scaled(state_scaled, control_scaled, params, bounds, scale_factors,
 
     x_scaled = state_scaled
     u_scaled = control_scaled
-
 
     return (T / S_x) * dynamics(S_x*x_scaled + x_offsets, S_u*u_scaled + u_offsets, params)
 
@@ -143,12 +166,12 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     mf_scaled = (terminal_conditions['mf'] - offsets['m']) / scale_factors['m']
 
     # Scaled control bounds
-    u_min_scaled = bounds['u_min'] / scale_factors['ux']
-    u_max_scaled = bounds['u_max'] / scale_factors['uy']
+    u_min_scaled = (bounds['u_min'] - offsets['ux']) / scale_factors['ux']
+    u_max_scaled = (bounds['u_max'] - offsets['ux']) / scale_factors['ux']
 
     # Scaled time horizon bounds
-    t_min_scaled = bounds['t_min'] / scale_factors['t']
-    t_max_scaled = bounds['t_max'] / scale_factors['t']
+    t_min_scaled = (bounds['t_min'] - offsets['t']) / scale_factors['t']
+    t_max_scaled = (bounds['t_max'] - offsets['t']) / scale_factors['t']
 
     # Scaled position and velocity tolerances for terminal constraints
     x_tol_scaled = tolerances['x_tol'] / scale_factors['x']
@@ -261,7 +284,11 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
         'expand': True,
         'ipopt.max_iter': 500,
         'ipopt.tol': 1e-6,
+        'ipopt.linear_solver': 'mumps',
+        'ipopt.hessian_approximation': 'exact',
         'ipopt.nlp_scaling_method': 'gradient-based',
+        # 'ipopt.nlp_scaling_method': 'none',
+        # 'ipopt.mu_strategy': 'adaptive',
     })
 
     try:
@@ -424,8 +451,8 @@ def plot_single_run(successful_run, N, R):
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection='3d')
     ax.plot(x_opt, y_opt, z_opt, 'b-', label='Trajectory')
-    ax.plot([x_opt[0]], [y_opt[0]], [z_opt[0]], 'go', label='Start')
-    ax.plot([x_opt[-1]], [y_opt[-1]], [z_opt[-1]], 'ro', label='End')
+    ax.plot([x_opt[0]], [y_opt[0]], [z_opt[0]], 'ro', label='Start')
+    ax.plot([x_opt[-1]], [y_opt[-1]], [z_opt[-1]], 'go', label='End')
 
     # Draw thrust vectors
     thrust_scale = 0.5  # Scale factor for visualization
@@ -616,6 +643,8 @@ def main():
 
     if (num_runs == 1 and num_success == 1):
         plot_single_run(successful_runs[0], N, params['R'])
+        comparison = traj_val.compare_optimized_vs_simulated_trajectories(dynamics_np, initial_conditions, successful_runs[0], params, N)
+        traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N)
     elif (num_runs > 1 and num_success > 0):
         plot_multiple_runs(successful_runs, N, params['R'])
 
