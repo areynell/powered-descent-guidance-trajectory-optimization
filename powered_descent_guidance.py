@@ -1,14 +1,16 @@
 # TODO:
 # 0) Plot planet's surface near landing site, and add linear surface constraint instead of radial constraint
-# 0) Add glide-slope constraint near landing site
-# 0) Add drag force
-# 1) Make 2D animation of trajectory and control input
-# 2) Scale variables for faster/more robust convergence
-# 3) Use polynomial trajectories for state and controls that match collocation method
-# 4) Plot midpoints as well
-# 5) Try different collocation methods
-# 6) Add rotation of planet
-# 7) Re-order functions to make reading flow easier
+# 1) Split path constraints, initial guesses, and objective function into separate functions for clarity
+# 2) Add glide-slope constraint near landing site
+# 3) Change vehicle's mass, thrust and surface area to be more realistic
+# 4) Add drag force
+# 5) Make 2D animation of trajectory and control input
+# 6) Scale variables for faster/more robust convergence
+# 7) Use polynomial trajectories for state and controls that match collocation method
+# 8) Plot midpoints as well
+# 9) Try different collocation methods
+# 10) Add rotation of planet
+# 11) Re-order functions to make reading flow easier
 
 import numpy as np
 import casadi as ca
@@ -17,7 +19,45 @@ from time import time
 import trajectory_validation as traj_val
 import trajectory_plotting as traj_plot
 
-# TODO: Generalize dynamics function to accept both CasADi and NumPy inputs
+def dynamics_scaled(state_scaled, control_scaled, params, bounds, scale_factors, offsets):
+    """
+    Scaled dynamics in non-dimensional units.
+    state = [x, y, z, vx, vy, vz, m] (scaled)
+    control = [ux, uy, uz] (scaled)
+    returns scaled derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt, dvz/dt, dm/dt]
+    computed by unscaling the inputs, calling dynamics(), and rescaling the outputs.
+    """
+    T = scale_factors['t']
+    S_x = ca.vertcat(scale_factors['x'],
+                     scale_factors['y'],
+                     scale_factors['z'],
+                     scale_factors['vx'],
+                     scale_factors['vy'],
+                     scale_factors['vz'],
+                     scale_factors['m'])
+    S_u = ca.vertcat(scale_factors['ux'],
+                     scale_factors['uy'],
+                     scale_factors['uz'],
+                     scale_factors['gamma'])
+
+    x_offsets = ca.vertcat(offsets['x'],
+                           offsets['y'],
+                           offsets['z'],
+                           offsets['vx'],
+                           offsets['vy'],
+                           offsets['vz'],
+                           offsets['m'])
+    u_offsets = ca.vertcat(offsets['ux'],
+                           offsets['uy'],
+                           offsets['uz'],
+                           offsets['gamma'])
+
+    x_scaled = state_scaled
+    u_scaled = control_scaled
+
+    return (T / S_x) * dynamics_ca(S_x*x_scaled + x_offsets, S_u*u_scaled + u_offsets, params)
+
+# TODO: Generalize dynamics function to accept both CasADi and NumPy inputs, so we don't need to update both separately
 def dynamics_np(state, control, params):
     x, y, z, vx, vy, vz, m = state
     ux, uy, uz = control
@@ -40,47 +80,12 @@ def dynamics_np(state, control, params):
 
     return np.array([dxdt, dydt, dzdt, dvxdt, dvydt, dvzdt, dmdt])
 
-def dynamics_scaled(state_scaled, control_scaled, params, bounds, scale_factors, offsets):
-    """
-    Scaled dynamics in non-dimensional units.
-    state = [x, y, z, vx, vy, vz, m] (scaled)
-    control = [ux, uy, uz] (scaled)
-    returns scaled derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt, dvz/dt, dm/dt]
-    computed by unscaling the inputs, calling dynamics(), and rescaling the outputs.
-    """
-    T = scale_factors['t']
-    S_x = ca.vertcat(scale_factors['x'],
-                     scale_factors['y'],
-                     scale_factors['z'],
-                     scale_factors['vx'],
-                     scale_factors['vy'],
-                     scale_factors['vz'],
-                     scale_factors['m'])
-    S_u = ca.vertcat(scale_factors['ux'],
-                     scale_factors['uy'],
-                     scale_factors['uz'])
-
-    x_offsets = ca.vertcat(offsets['x'],
-                           offsets['y'],
-                           offsets['z'],
-                           offsets['vx'],
-                           offsets['vy'],
-                           offsets['vz'],
-                           offsets['m'])
-    u_offsets = ca.vertcat(offsets['ux'],
-                           offsets['uy'],
-                           offsets['uz'])
-
-    x_scaled = state_scaled
-    u_scaled = control_scaled
-
-    return (T / S_x) * dynamics(S_x*x_scaled + x_offsets, S_u*u_scaled + u_offsets, params)
-
-def dynamics(state, control, params):
+# TODO: Generalize dynamics function to accept both CasADi and NumPy inputs, so we don't need to update both separately
+def dynamics_ca(state, control, params):
     """
     Unscaled dynamics in physical units.
     state = [x, y, z, vx, vy, vz, m]
-    control = [ux, uy, uz]
+    control = [ux, uy, uz, gamma]
     returns derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt, dvz/dt, dm/dt]
     """
     x = state[0]
@@ -94,6 +99,7 @@ def dynamics(state, control, params):
     ux = control[0]
     uy = control[1]
     uz = control[2]
+    gamma = control[3]
 
     G = params['G']
     M = params['M']
@@ -101,7 +107,6 @@ def dynamics(state, control, params):
     g0 = params['g0']
 
     r = ca.sqrt(x**2 + y**2 + z**2)
-    u_total = ca.sqrt(ux**2 + uy**2 + uz**2)
 
     dxdt = vx
     dydt = vy
@@ -109,7 +114,7 @@ def dynamics(state, control, params):
     dvxdt = -G * M * (x / r**3) + ux / m
     dvydt = -G * M * (y / r**3) + uy / m
     dvzdt = -G * M * (z / r**3) + uz / m
-    dmdt = -u_total / (Isp * g0)
+    dmdt = -gamma / (Isp * g0)
 
     return ca.vertcat(dxdt, dydt, dzdt, dvxdt, dvydt, dvzdt, dmdt)
 
@@ -147,7 +152,7 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
 
     # State dimensions
     num_states = 7  # [x, y, z, vx, vy, vz, m]
-    num_controls = 3  # [ux, uy, uz]
+    num_controls = 4  # [ux, uy, uz, gamma]
 
     # Scaled initial conditions
     x0_scaled = (initial_conditions['x0'] - offsets['x']) / scale_factors['x']
@@ -168,8 +173,8 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     mf_scaled = (terminal_conditions['mf'] - offsets['m']) / scale_factors['m']
 
     # Scaled control bounds
-    u_min_scaled = (bounds['u_min'] - offsets['ux']) / scale_factors['ux']
-    u_max_scaled = (bounds['u_max'] - offsets['ux']) / scale_factors['ux']
+    u_min_scaled = (bounds['u_min'] - offsets['gamma']) / scale_factors['gamma']
+    u_max_scaled = (bounds['u_max'] - offsets['gamma']) / scale_factors['gamma']
 
     # Scaled time horizon bounds
     t_min_scaled = (bounds['t_min'] - offsets['t']) / scale_factors['t']
@@ -201,6 +206,7 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     ux_scaled = U_scaled[0, :]
     uy_scaled = U_scaled[1, :]
     uz_scaled = U_scaled[2, :]
+    gamma_scaled = U_scaled[3, :] # Thrust magnitude slack variable for convex relaxation
 
     # Scaled final time
     tf_scaled = opti.variable()
@@ -211,7 +217,7 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     # Slack variable for surface constraint
     slack_surface = opti.variable(1, N+1)
 
-    # Initial constraints
+    # Initial state constraints
     opti.subject_to(x_scaled[0] == x0_scaled)
     opti.subject_to(y_scaled[0] == y0_scaled)
     opti.subject_to(z_scaled[0] == z0_scaled)
@@ -220,13 +226,15 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     opti.subject_to(vz_scaled[0] == vz0_scaled)
     opti.subject_to(m_scaled[0] == m0_scaled)
 
-    # Final constraints
+    # Final state constraints
     opti.subject_to(opti.bounded(xf_scaled - x_tol_scaled, x_scaled[-1], xf_scaled + x_tol_scaled))
     opti.subject_to(opti.bounded(yf_scaled - y_tol_scaled, y_scaled[-1], yf_scaled + y_tol_scaled))
     opti.subject_to(opti.bounded(zf_scaled - z_tol_scaled, z_scaled[-1], zf_scaled + z_tol_scaled))
     opti.subject_to(opti.bounded(vxf_scaled - vx_tol_scaled, vx_scaled[-1], vxf_scaled + vx_tol_scaled))
     opti.subject_to(opti.bounded(vyf_scaled - vy_tol_scaled, vy_scaled[-1], vyf_scaled + vy_tol_scaled))
     opti.subject_to(opti.bounded(vzf_scaled - vz_tol_scaled, vz_scaled[-1], vzf_scaled + vz_tol_scaled))
+
+    # Time constraints
     opti.subject_to(opti.bounded(t_min_scaled, tf_scaled, t_max_scaled))
 
     # Path constraints
@@ -238,9 +246,13 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     opti.subject_to(slack_surface >= 0)
     opti.subject_to(ca.sqrt(x_phys**2 + y_phys**2 + z_phys**2) / params['R'] >= 1.0 - slack_surface)
 
-    # Thrust magnitude constraints
-    opti.subject_to(ux_scaled**2 + uy_scaled**2 + uz_scaled**2 >= u_min_scaled**2) # Min thrust magnitude limit
-    opti.subject_to(ux_scaled**2 + uy_scaled**2 + uz_scaled**2 <= u_max_scaled**2) # Max thrust magnitude limit
+    # Control constraints
+    opti.subject_to(opti.bounded(-u_max_scaled, ux_scaled, u_max_scaled))
+    opti.subject_to(opti.bounded(-u_max_scaled, uy_scaled, u_max_scaled))
+    opti.subject_to(opti.bounded(-u_max_scaled, uz_scaled, u_max_scaled))
+    # Convex relaxation of thrust magnitude
+    opti.subject_to(ux_scaled**2 + uy_scaled**2 + uz_scaled**2 <= gamma_scaled**2)
+    opti.subject_to(opti.bounded(u_min_scaled, gamma_scaled, u_max_scaled))
 
     # Mass constraints
     opti.subject_to(m_scaled >= mf_scaled)  # Keep mass above dry-mass lower bound everywhere
@@ -268,6 +280,7 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
         opti.set_initial(ux_scaled[i], u_min_scaled)
         opti.set_initial(uy_scaled[i], u_min_scaled)
         opti.set_initial(uz_scaled[i], u_min_scaled)
+        opti.set_initial(gamma_scaled[i], u_min_scaled)
 
     # Initialize slack on surface constraint to zero
     opti.set_initial(slack_surface, 0.0)
@@ -363,6 +376,7 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
         ux_opt = sol.value(ux_scaled) * scale_factors['ux'] + offsets['ux']
         uy_opt = sol.value(uy_scaled) * scale_factors['uy'] + offsets['uy']
         uz_opt = sol.value(uz_scaled) * scale_factors['uz'] + offsets['uz']
+        gamma_opt = sol.value(gamma_scaled) * scale_factors['gamma'] + offsets['gamma']
 
         print(f"--- Run succeeded ---")
         print(f"Converged in {iterations} iterations ({t_solve:.2f} seconds)")
@@ -383,6 +397,7 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
             "ux_opt": sol.value(ux_opt),
             "uy_opt": sol.value(uy_opt),
             "uz_opt": sol.value(uz_opt),
+            "gamma_opt": sol.value(gamma_opt)
         }
     except Exception as e:
         print(f"--- Run failed: {e} ---")
@@ -454,16 +469,17 @@ def main():
 
         # Scaling factors for non-dimensionalization
         scale_factors = {
-            'x': params['R'],
-            'y': params['R'],
-            'z': params['R'],
+            'x': params['R'],  # Planet radius
+            'y': params['R'],  # Planet radius
+            'z': params['R'],  # Planet radius
             'vx': 1000.0,     # 1000 m/s
             'vy': 1000.0,     # 1000 m/s
             'vz': 1000.0,     # 1000 m/s
             'm': 100.0,       # 100 kg,
-            'ux': 5000.0,     # 5 kN
-            'uy': 5000.0,     # 5 kN
-            'uz': 5000.0,     # 5 kN
+            'ux': 5000.0,  # 5 kN
+            'uy': 5000.0,  # 5 kN
+            'uz': 5000.0,  # 5 kN
+            'gamma': 5000.0,  # 5 kN
             't': 250.0        # 250 seconds,
         }
 
@@ -479,6 +495,7 @@ def main():
             'ux': 0.0,
             'uy': 0.0,
             'uz': 0.0,
+            'gamma': 0.0,
             't': 0.0
         }
 
