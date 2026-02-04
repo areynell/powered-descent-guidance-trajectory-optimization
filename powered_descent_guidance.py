@@ -3,14 +3,13 @@
 # 1) Split path constraints, initial guesses, and objective function into separate functions for clarity
 # 2) Add glide-slope constraint near landing site
 # 3) Change vehicle's mass, thrust and surface area to be more realistic
-# 4) Add drag force
-# 5) Make 2D animation of trajectory and control input
-# 6) Scale variables for faster/more robust convergence
-# 7) Use polynomial trajectories for state and controls that match collocation method
-# 8) Plot midpoints as well
-# 9) Try different collocation methods
-# 10) Add rotation of planet
-# 11) Re-order functions to make reading flow easier
+# 4) Make 2D animation of trajectory and control input
+# 5) Use polynomial trajectories for state and controls that match collocation method
+# 6) Plot midpoints as well
+# 7) Try different collocation methods
+# 8) Add rotation of planet
+# 9) Re-order functions to make reading flow easier
+# 10) Add 6-DOF dynamics
 
 import numpy as np
 import casadi as ca
@@ -19,7 +18,7 @@ from time import time
 import trajectory_validation as traj_val
 import trajectory_plotting as traj_plot
 
-def dynamics_scaled(state_scaled, control_scaled, params, bounds, scale_factors, offsets):
+def dynamics_scaled(state_scaled, control_scaled, planet_params, rocket_params, bounds, scale_factors, offsets):
     """
     Scaled dynamics in non-dimensional units.
     state = [x, y, z, vx, vy, vz, m] (scaled)
@@ -55,33 +54,48 @@ def dynamics_scaled(state_scaled, control_scaled, params, bounds, scale_factors,
     x_scaled = state_scaled
     u_scaled = control_scaled
 
-    return (T / S_x) * dynamics_ca(S_x*x_scaled + x_offsets, S_u*u_scaled + u_offsets, params)
+    return (T / S_x) * dynamics_ca(S_x*x_scaled + x_offsets, S_u*u_scaled + u_offsets, planet_params, rocket_params)
 
 # TODO: Generalize dynamics function to accept both CasADi and NumPy inputs, so we don't need to update both separately
-def dynamics_np(state, control, params):
+def dynamics_np(state, control, planet_params, rocket_params):
     x, y, z, vx, vy, vz, m = state
     ux, uy, uz = control
 
-    G = params['G']
-    M = params['M']
-    Isp = params['Isp']
-    g0 = params['g0']
+    G = planet_params['G']
+    M = planet_params['M']
+    R = planet_params['R']
+    rho0 = planet_params['rho0']
+    H = planet_params['H']
+
+    Isp = rocket_params['Isp']
+    g0 = rocket_params['g0']
+    Aref = rocket_params['Aref']
+    Cd = rocket_params['Cd']
+
+    u_total = np.sqrt(ux**2 + uy**2 + uz**2)
 
     r = np.sqrt(x**2 + y**2 + z**2)
-    u_total = np.sqrt(ux**2 + uy**2 + uz**2)
+    h = r - R
+    rho = rho0 * np.exp(-h / H)
+    v = np.sqrt(vx**2 + vy**2 + vz**2)
+
+    D = -0.5 * rho * Cd * Aref * v * np.array([vx, vy, vz])
+    Dx = D[0]
+    Dy = D[1]
+    Dz = D[2]
 
     dxdt = vx
     dydt = vy
     dzdt = vz
-    dvxdt = -G * M * (x / r**3) + ux / m
-    dvydt = -G * M * (y / r**3) + uy / m
-    dvzdt = -G * M * (z / r**3) + uz / m
+    dvxdt = -G * M * (x / r**3) + ux / m + Dx / m
+    dvydt = -G * M * (y / r**3) + uy / m + Dy / m
+    dvzdt = -G * M * (z / r**3) + uz / m + Dz / m
     dmdt = -u_total / (Isp * g0)
 
     return np.array([dxdt, dydt, dzdt, dvxdt, dvydt, dvzdt, dmdt])
 
 # TODO: Generalize dynamics function to accept both CasADi and NumPy inputs, so we don't need to update both separately
-def dynamics_ca(state, control, params):
+def dynamics_ca(state, control, planet_params, rocket_params):
     """
     Unscaled dynamics in physical units.
     state = [x, y, z, vx, vy, vz, m]
@@ -101,24 +115,38 @@ def dynamics_ca(state, control, params):
     uz = control[2]
     gamma = control[3]
 
-    G = params['G']
-    M = params['M']
-    Isp = params['Isp']
-    g0 = params['g0']
+    G = planet_params['G']
+    M = planet_params['M']
+    R = planet_params['R']
+    rho0 = planet_params['rho0']
+    H = planet_params['H']
+
+    Isp = rocket_params['Isp']
+    g0 = rocket_params['g0']
+    Aref = rocket_params['Aref']
+    Cd = rocket_params['Cd']
 
     r = ca.sqrt(x**2 + y**2 + z**2)
+    h = r - R
+    rho = rho0 * ca.exp(-h / H)
+    eps = 1e-8
+    v = ca.sqrt(vx**2 + vy**2 + vz**2 + eps)
+    D = -0.5 * rho * Cd * Aref * v * ca.vertcat(vx, vy, vz)
+    Dx = D[0]
+    Dy = D[1]
+    Dz = D[2]
 
     dxdt = vx
     dydt = vy
     dzdt = vz
-    dvxdt = -G * M * (x / r**3) + ux / m
-    dvydt = -G * M * (y / r**3) + uy / m
-    dvzdt = -G * M * (z / r**3) + uz / m
+    dvxdt = -G * M * (x / r**3) + ux / m + Dx / m
+    dvydt = -G * M * (y / r**3) + uy / m + Dy / m
+    dvzdt = -G * M * (z / r**3) + uz / m + Dz / m
     dmdt = -gamma / (Isp * g0)
 
     return ca.vertcat(dxdt, dydt, dzdt, dvxdt, dvydt, dvzdt, dmdt)
 
-def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, bounds, scale_factors, offsets, N):
+def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, planet_params, rocket_params, bounds, scale_factors, offsets, N):
     """
     Add dynamic constraints using Hermite-Simpson collocation.
     """
@@ -130,8 +158,8 @@ def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled,
         uk_next = U_scaled[:, k+1]
 
         # Dynamics at beginning and end of interval
-        fk = dynamics_scaled(xk, uk, params, bounds, scale_factors, offsets)
-        fk_next = dynamics_scaled(xk_next, uk_next, params, bounds, scale_factors, offsets)
+        fk = dynamics_scaled(xk, uk, planet_params, rocket_params, bounds, scale_factors, offsets)
+        fk_next = dynamics_scaled(xk_next, uk_next, planet_params, rocket_params, bounds, scale_factors, offsets)
 
         # Midpoint state (Hermite interpolation)
         xk_mid = 0.5 * (xk + xk_next) + (dt_scaled/8.0) * (fk - fk_next)
@@ -140,12 +168,12 @@ def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled,
         uk_mid = 0.5 * (uk + uk_next)
 
         # Dynamics at midpoint
-        fk_mid = dynamics_scaled(xk_mid, uk_mid, params, bounds, scale_factors, offsets)
+        fk_mid = dynamics_scaled(xk_mid, uk_mid, planet_params, rocket_params, bounds, scale_factors, offsets)
 
         # Simpson integration
         opti.subject_to(xk_next == xk + (dt_scaled/6.0) * (fk + 4.0*fk_mid + fk_next))
 
-def run_optimization(initial_conditions, terminal_conditions, params, bounds, tolerances, scale_factors, offsets, N):
+def run_optimization(initial_conditions, terminal_conditions, planet_params, rocket_params, bounds, landing_tolerances, scale_factors, offsets, N):
     """
     Set up the objective function and constraints, and solve a single trajectory optimization problem.
     """
@@ -181,12 +209,12 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     t_max_scaled = (bounds['t_max'] - offsets['t']) / scale_factors['t']
 
     # Scaled position and velocity tolerances for terminal constraints
-    x_tol_scaled = tolerances['x_tol'] / scale_factors['x']
-    y_tol_scaled = tolerances['y_tol'] / scale_factors['y']
-    z_tol_scaled = tolerances['z_tol'] / scale_factors['z']
-    vx_tol_scaled = tolerances['vx_tol'] / scale_factors['vx']
-    vy_tol_scaled = tolerances['vy_tol'] / scale_factors['vy']
-    vz_tol_scaled = tolerances['vz_tol'] / scale_factors['vz']
+    x_tol_scaled = landing_tolerances['x_tol'] / scale_factors['x']
+    y_tol_scaled = landing_tolerances['y_tol'] / scale_factors['y']
+    z_tol_scaled = landing_tolerances['z_tol'] / scale_factors['z']
+    vx_tol_scaled = landing_tolerances['vx_tol'] / scale_factors['vx']
+    vy_tol_scaled = landing_tolerances['vy_tol'] / scale_factors['vy']
+    vz_tol_scaled = landing_tolerances['vz_tol'] / scale_factors['vz']
 
     # Optimization variables
     opti = ca.Opti()
@@ -244,7 +272,7 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
     z_phys = z_scaled * scale_factors['z'] + offsets['z']
     # IMPORTANT: Normalizing by R to keep gradients well-scaled (r >= R => r/R >= 1), and using slack variable to improve convergence
     opti.subject_to(slack_surface >= 0)
-    opti.subject_to(ca.sqrt(x_phys**2 + y_phys**2 + z_phys**2) / params['R'] >= 1.0 - slack_surface)
+    opti.subject_to(ca.sqrt(x_phys**2 + y_phys**2 + z_phys**2) / planet_params['R'] >= 1.0 - slack_surface)
 
     # Control constraints
     opti.subject_to(opti.bounded(-u_max_scaled, ux_scaled, u_max_scaled))
@@ -262,7 +290,7 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
         opti.subject_to(m_scaled[k+1] <= m_scaled[k])
 
     # Dynamic equality constraints
-    add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, params, bounds, scale_factors, offsets, N)
+    add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, planet_params, rocket_params, bounds, scale_factors, offsets, N)
 
     # Initial guess solution: Linear interpolation between boundary conditions for states, min thrust for controls
     for i in range(N+1):
@@ -404,44 +432,49 @@ def run_optimization(initial_conditions, terminal_conditions, params, bounds, to
         return {"success": False}
 
 def main():
-    # Parameters
-    N = 50 # Number of control intervals
-    num_runs = 100 # Number of randomized runs to perform
-
-    # Physical parameters
-    params = {
+        # Physical parameters
+    planet_params = {
         'G': 6.672e-11, # Gravitational constant (m^3/kg/s^2)
         'M': 5.972e24, # Mass of Earth (kg)
         'R': 6.371e6, # Radius of Earth (m)
-        'Isp': 300.0, # Rocket engine specific impulse (s)
-        'g0': 9.81, # Standard gravity (m/s^2)
         'rho0': 1.225, # Air density at sea level (kg/m^3)
-        'H': 8500.0, # Scale height of atmosphere (m)
-        'Cd': 1.5, # Drag coefficient (assumed)
-        'Aref': 1.0, # Reference area (m^2, assumed)
+        'H': 8500.0, # Scale height of Earth's atmosphere (m)
+    }
+
+    # Rocket parameters
+    rocket_params = {
+        'thrust_min': 1*338000.0, # Minimum thrust from 1 engine (N) - ~40% throttle
+        'thrust_max': 3*845000.0, # Maximum thrust from 3 engines (N) - Merlin 1D SL
+        'Isp': 282.0, # Specific impulse (s)
+        # 'Isp': 500.0, # Specific impulse (s)
+        'g0': 9.81, # Standard gravity (m/s^2)
+        'mass_start': 75000.0, # Starting mass (kg) - Falcon 9 Mass at start of boostback burn
+        'mass_dry': 22200.0, # Dry mass (kg) - Falcon 9 Dry Mass
+        'Aref': np.pi*(3.7/2)**2, # Reference area (m^2)
+        'Cd': 1.8 # Drag coefficient (assumed)
     }
 
     # Fixed terminal conditions for all runs
     terminal_conditions = {
         'xf': 0.0, # Final x-position (m)
         'yf': 0.0, # Final y-position (m)
-        'zf': params['R'], # Final z-position (m)
+        'zf': planet_params['R'], # Final z-position (m)
         'vxf': 0.0, # Final x-velocity (m/s)
         'vyf': 0.0, # Final y-velocity (m/s)
         'vzf': 0.0, # Final z-velocity (m/s)
-        'mf': 10.0 # Minimum ALLOWABLE final mass (kg)
+        'mf': rocket_params['mass_dry'] # Minimum ALLOWABLE final mass (kg)
     }
 
     # Control and time bounds
     bounds = {
-        'u_min': 1.0,      # Minimum thrust (N)
-        'u_max': 5000.0,   # Maximum thrust (N)
+        'u_min': rocket_params['thrust_min'], # Minimum thrust (N)
+        'u_max': rocket_params['thrust_max'], # Maximum thrust (N)
         't_min': 1.0,      # Minimum trajectory time (s)
-        't_max': 250.0     # Maximum trajectory time (s)
+        't_max': 500.0     # Maximum trajectory time (s)
     }
 
     # Position and velocity tolerances for terminal constraints
-    tolerances = {
+    landing_tolerances = {
         'x_tol': 1.0,    # Position tolerance (m)
         'y_tol': 1.0,    # Position tolerance (m)
         'z_tol': 1.0,    # Position tolerance (m)
@@ -450,37 +483,40 @@ def main():
         'vz_tol': 0.5,    # Velocity tolerance (m/s)
     }
 
+    N = 50 # Number of control intervals
+    num_runs = 100 # Number of randomized runs to perform
+
     results = []
     failed_initial_conditions = []
     t_start_total = time()
-    np.random.seed(0)
+    np.random.seed(8)
     for i in range(num_runs):
         print(f"--- Starting run {i+1}/{num_runs} ---")
         # Randomized initial conditions
         initial_conditions = {
             'x0': np.random.uniform(-50000.0, 50000.0), # m
             'y0': np.random.uniform(-50000.0, 50000.0), # m
-            'z0': params['R'] + np.random.uniform(50000.0, 100000.0), # m
-            'vx0': np.random.uniform(-2500.0, 2500.0), # m/s
-            'vy0': np.random.uniform(-2500.0, 2500.0), # m/s
-            'vz0': np.random.uniform(-1000.0, 0.0), # m/s
-            'm0': 100.0 # kg
+            'z0': planet_params['R'] + np.random.uniform(50000.0, 150000.0), # m
+            'vx0': np.random.uniform(-1000.0, 1000.0), # m/s
+            'vy0': np.random.uniform(-1000.0, 1000.0), # m/s
+            'vz0': np.random.uniform(-500.0, 500.0), # m/s
+            'm0': rocket_params['mass_start'] # kg - Landing mass (Dry mass + reserve)
         }
 
         # Scaling factors for non-dimensionalization
         scale_factors = {
-            'x': params['R'],  # Planet radius
-            'y': params['R'],  # Planet radius
-            'z': params['R'],  # Planet radius
-            'vx': 1000.0,     # 1000 m/s
-            'vy': 1000.0,     # 1000 m/s
-            'vz': 1000.0,     # 1000 m/s
-            'm': 100.0,       # 100 kg,
-            'ux': 5000.0,  # 5 kN
-            'uy': 5000.0,  # 5 kN
-            'uz': 5000.0,  # 5 kN
-            'gamma': 5000.0,  # 5 kN
-            't': 250.0        # 250 seconds,
+            'x': planet_params['R'],
+            'y': planet_params['R'],
+            'z': planet_params['R'],
+            'vx': 1000.0,
+            'vy': 1000.0,
+            'vz': 1000.0,
+            'm': rocket_params['mass_start'],
+            'ux': rocket_params['thrust_max'],
+            'uy': rocket_params['thrust_max'],
+            'uz': rocket_params['thrust_max'],
+            'gamma': rocket_params['thrust_max'],
+            't': bounds['t_max']
         }
 
         # Offsets for non-dimensionalization
@@ -501,7 +537,7 @@ def main():
 
         print(f"Initial conditions (run {i+1}): {initial_conditions}")
 
-        result = run_optimization(initial_conditions, terminal_conditions, params, bounds, tolerances, scale_factors, offsets, N)
+        result = run_optimization(initial_conditions, terminal_conditions, planet_params, rocket_params, bounds, landing_tolerances, scale_factors, offsets, N)
         results.append(result)
         if not result['success']:
             failed_initial_conditions.append(initial_conditions)
@@ -524,11 +560,11 @@ def main():
             print(initial_condition)
 
     if (num_runs == 1 and num_success == 1):
-        traj_plot.plot_single_run(successful_runs[0], N, params['R'])
-        comparison = traj_val.compare_optimized_vs_simulated_trajectories(dynamics_np, initial_conditions, successful_runs[0], params, N)
+        traj_plot.plot_single_run(successful_runs[0], N, planet_params['R'])
+        comparison = traj_val.compare_optimized_vs_simulated_trajectories(dynamics_np, initial_conditions, successful_runs[0], planet_params, rocket_params, N)
         traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N)
     elif (num_runs > 1 and num_success > 0):
-        traj_plot.plot_multiple_runs(successful_runs, N, params['R'])
+        traj_plot.plot_multiple_runs(successful_runs, N, planet_params['R'])
 if __name__ == "__main__":
     np.set_printoptions(suppress=True, precision=5)
     main()
