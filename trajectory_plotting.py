@@ -75,7 +75,7 @@ def plot_single_run(trajectory, N, R):
 
     # Draw thrust vectors
     thrust_scale = 0.01  # Scale factor for visualization
-    stride = max(1, N // 100) # Prevent drawing too many arrows
+    stride = max(1, N // 50) # Prevent drawing too many arrows
     for i in range(0, N, stride):
         # Calculate thrust magnitude
         thrust_magnitude = np.sqrt(ux[i]**2 + uy[i]**2 + uz[i]**2)
