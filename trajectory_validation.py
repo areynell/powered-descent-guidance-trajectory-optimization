@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-def simulate_trajectory_rk4(dynamics_fn, initial_state, control_inputs, tf, params, N):
+def simulate_trajectory_rk4(dynamics_fn, initial_state, control_inputs, tf, planet_params, rocket_params, N):
     """
     Simulate the trajectory using RK4 integration with the optimal control inputs.
 
@@ -10,7 +10,8 @@ def simulate_trajectory_rk4(dynamics_fn, initial_state, control_inputs, tf, para
         initial_state: Array of system states at initial time
         control_inputs: Array of control inputs at each timenode
         tf: Final time
-        params: Physical parameters
+        planet_params: Physical parameters
+        rocket_params: Rocket parameters
         N: Number of control intervals
 
     Returns:
@@ -32,17 +33,17 @@ def simulate_trajectory_rk4(dynamics_fn, initial_state, control_inputs, tf, para
         u_mid = 0.5 * (u[:, k] + u[:, k+1])
 
         # RK4 components
-        k1 = dynamics_fn(X_sim[:, k], u[:, k], params)
-        k2 = dynamics_fn(X_sim[:, k] + 0.5 * dt * k1, u_mid, params)
-        k3 = dynamics_fn(X_sim[:, k] + 0.5 * dt * k2, u_mid, params)
-        k4 = dynamics_fn(X_sim[:, k] + dt * k3, u[:, k+1], params)
+        k1 = dynamics_fn(X_sim[:, k], u[:, k], planet_params, rocket_params)
+        k2 = dynamics_fn(X_sim[:, k] + 0.5 * dt * k1, u_mid, planet_params, rocket_params)
+        k3 = dynamics_fn(X_sim[:, k] + 0.5 * dt * k2, u_mid, planet_params, rocket_params)
+        k4 = dynamics_fn(X_sim[:, k] + dt * k3, u[:, k+1], planet_params, rocket_params)
 
         # State update
         X_sim[:, k+1] = X_sim[:, k] + (dt / 6.0) * (k1 + 2.0*k2 + 2.0*k3 + k4)
 
     return t_sim, X_sim
 
-def compare_optimized_vs_simulated_trajectories(dynamics_fn, initial_state, optimized_trajectory, params, N):
+def compare_optimized_vs_simulated_trajectories(dynamics_fn, initial_state, optimized_trajectory, planet_params, rocket_params, N):
     """
     Compare the optimized trajectory with RK4-simulated trajectory using optimal controls.
 
@@ -50,7 +51,8 @@ def compare_optimized_vs_simulated_trajectories(dynamics_fn, initial_state, opti
         dynamics_fn: Function to compute state derivatives
         initial_state: Initial state array
         optimized_trajectory: Optimization result dictionary
-        params: Physical parameters
+        planet_params: Physical parameters
+        rocket_params: Rocket parameters
         N: Number of control intervals
 
     Returns:
@@ -81,7 +83,7 @@ def compare_optimized_vs_simulated_trajectories(dynamics_fn, initial_state, opti
 
     # Simulate trajectory using RK4
     u_opt = np.vstack([ux_opt, uy_opt, uz_opt])
-    t_sim, X_sim = simulate_trajectory_rk4(dynamics_fn, X0, u_opt, tf_opt, params, N)
+    t_sim, X_sim = simulate_trajectory_rk4(dynamics_fn, X0, u_opt, tf_opt, planet_params, rocket_params, N)
 
     # Extract simulated states
     x_sim = X_sim[0, :]
@@ -108,12 +110,12 @@ def compare_optimized_vs_simulated_trajectories(dynamics_fn, initial_state, opti
     }
 
     print("\n--- Optimized vs Simulated Trajectory Comparison ---")
-    print(f"Max position error:   {metrics['max_pos_error']:.6e} m")
-    print(f"Max velocity error:   {metrics['max_vel_error']:.6e} m/s")
-    print(f"Max mass error:       {metrics['max_mass_error']:.6e} kg")
-    print(f"Final position error: {metrics['final_pos_error']:.6e} m")
-    print(f"Final velocity error: {metrics['final_vel_error']:.6e} m/s")
-    print(f"Final mass error:     {metrics['final_mass_error']:.6e} kg")
+    print(f"Max position error:   {metrics['max_pos_error']:.2f} m")
+    print(f"Max velocity error:   {metrics['max_vel_error']:.2f} m/s")
+    print(f"Max mass error:       {metrics['max_mass_error']:.2f} kg")
+    print(f"Final position error: {metrics['final_pos_error']:.2f} m")
+    print(f"Final velocity error: {metrics['final_vel_error']:.2f} m/s")
+    print(f"Final mass error:     {metrics['final_mass_error']:.2f} kg")
 
     return {
         't_sim': t_sim,
@@ -162,8 +164,6 @@ def plot_trajectory_comparison(optimized_trajectory, simulated_comparison, N):
     axes[2].set_ylabel('Mass Error [kg]')
     axes[2].grid()
     axes[2].set_title('Mass Error vs. Time')
-
-    plt.tight_layout()
 
     # 3D trajectory comparison
     fig2 = plt.figure(figsize=(10, 10))

@@ -432,7 +432,7 @@ def run_optimization(initial_conditions, terminal_conditions, planet_params, roc
         return {"success": False}
 
 def main():
-        # Physical parameters
+    # Planet parameters
     planet_params = {
         'G': 6.672e-11, # Gravitational constant (m^3/kg/s^2)
         'M': 5.972e24, # Mass of Earth (kg)
@@ -443,7 +443,7 @@ def main():
 
     # Rocket parameters
     rocket_params = {
-        'thrust_min': 1*338000.0, # Minimum thrust from 1 engine (N) - ~40% throttle
+        'thrust_min': 0.4*845000.0, # Minimum thrust from 1 engine (N) - ~40% throttle
         'thrust_max': 3*845000.0, # Maximum thrust from 3 engines (N) - Merlin 1D SL
         'Isp': 282.0, # Specific impulse (s)
         # 'Isp': 500.0, # Specific impulse (s)
@@ -484,7 +484,7 @@ def main():
     }
 
     N = 50 # Number of control intervals
-    num_runs = 100 # Number of randomized runs to perform
+    num_runs = 1 # Number of randomized runs to perform
 
     results = []
     failed_initial_conditions = []
@@ -502,6 +502,16 @@ def main():
             'vz0': np.random.uniform(-500.0, 500.0), # m/s
             'm0': rocket_params['mass_start'] # kg - Landing mass (Dry mass + reserve)
         }
+
+        # --- Failed Initial Conditions ---
+        # initial_conditions = {'x0': 10333.00064753613, 'y0': -14102.69257401282, 'z0': 6451802.3336159075, 'vx0': 646.6701807114714, 'vy0': 121.62380764174964, 'vz0': -152.95896172646286, 'm0': 75000.0}
+        # initial_conditions = {'x0': -10988.148096549397, 'y0': 39553.273620720895, 'z0': 6430847.15719154, 'vx0': 821.1205393090227, 'vy0': 457.70904823551905, 'vz0': -372.8149990047769, 'm0': 75000.0}
+        # initial_conditions = {'x0': -2229.5538019762243, 'y0': 25230.130182274952, 'z0': 6450341.862722686, 'vx0': 15.920842801517665, 'vy0': 454.84039373955056, 'vz0': -156.4300590392359, 'm0': 75000.0}
+        # initial_conditions = {'x0': -20476.74314880714, 'y0': -13615.78880679213, 'z0': 6444010.141756712, 'vx0': 392.54362697458873, 'vy0': 284.2714639006099, 'vz0': -267.7434706956784, 'm0': 75000.0}
+        # initial_conditions = {'x0': 28840.55161689737, 'y0': -20875.4851646929, 'z0': 6434001.974537622, 'vx0': 559.796802578966, 'vy0': 368.6994615807289, 'vz0': -204.34760760308177, 'm0': 75000.0}
+        # initial_conditions = {'x0': -31518.45806321033, 'y0': 47770.549924390696, 'z0': 6433824.722904884, 'vx0': 209.2517851410796, 'vy0': 515.7533383325085, 'vz0': -79.33290732940077, 'm0': 75000.0}
+        # initial_conditions = {'x0': 31116.18834065397, 'y0': 28482.906354009217, 'z0': 6449458.003926393, 'vx0': 634.4300909114133, 'vy0': 76.80522338545347, 'vz0': -192.1010130966052, 'm0': 75000.0}
+        # initial_conditions = {'x0': -1481.8618443154555, 'y0': 28626.116533809356, 'z0': 6437017.691213863, 'vx0': 103.67629902591716, 'vy0': 725.7214163473893, 'vz0': -67.99194802672406, 'm0': 75000.0}
 
         # Scaling factors for non-dimensionalization
         scale_factors = {
@@ -564,7 +574,8 @@ def main():
         comparison = traj_val.compare_optimized_vs_simulated_trajectories(dynamics_np, initial_conditions, successful_runs[0], planet_params, rocket_params, N)
         traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N)
     elif (num_runs > 1 and num_success > 0):
-        traj_plot.plot_multiple_runs(successful_runs, N, planet_params['R'])
+        traj_plot.plot_multiple_runs(successful_runs)
+
 if __name__ == "__main__":
     np.set_printoptions(suppress=True, precision=5)
     main()
