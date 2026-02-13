@@ -4,9 +4,278 @@ from scipy.optimize import minimize_scalar
 import trajectory_plotting as traj_plot
 import trajectory_validation as traj_val
 
+class ZEMZEVTrajectoryGenerator:
+    def __init__(self, planet_params: dict, rocket_params: dict, state_dynamics_fn: callable):
+        """
+        Initializes the ZEM/ZEV trajectory generator. For more information, see the paper titled "Applications of Generalized Zero-Effort-Miss/Zero-Effort-Velocity Feedback Guidance Algorithm" by Guo, Hawkins and Wie.
+
+        Args:
+            planet_params (dict): Dictionary containing planetary parameters (e.g., gravity, atmosphere)
+            rocket_params (dict): Dictionary containing rocket parameters (e.g., mass, thrust limits)
+            state_dynamics_fn (callable): Function that computes the time derivative of the state vector given the current state and control input
+        """
+
+        self.planet_params = planet_params
+        self.rocket_params = rocket_params
+        self.state_dynamics_fn = state_dynamics_fn
+
+    # TODO: ADD JIT
+    def _rk4_step(self, state: np.ndarray, control: np.ndarray, dt: float) -> np.ndarray:
+        """
+        Perform a single RK4 integration step.
+
+        Args:
+            state (np.ndarray): Current state vector
+            control (np.ndarray): Control input vector
+            dt (float): Time step (s)
+
+        Returns:
+            next_state (np.ndarray): State vector after time step dt
+        """
+
+        k1 = self.state_dynamics_fn(state, control, self.planet_params, self.rocket_params)
+        k2 = self.state_dynamics_fn(state + 0.5 * dt * k1, control, self.planet_params, self.rocket_params)
+        k3 = self.state_dynamics_fn(state + 0.5 * dt * k2, control, self.planet_params, self.rocket_params)
+        k4 = self.state_dynamics_fn(state + dt * k3, control, self.planet_params, self.rocket_params)
+
+        next_state = state + (dt / 6.0) * (k1 + 2.0*k2 + 2.0*k3 + k4)
+        return next_state
+
+    # TODO: ADD JIT
+    def _propagate_states_rk4(self, initial_state: np.ndarray, controls: np.ndarray, tf: float, N: int) -> np.ndarray:
+        """
+        Simulate the trajectory using RK4 integration with control inputs.
+
+        Args:
+            initial_state (np.ndarray): Array of system states at initial time
+            controls (np.ndarray): Array of control inputs at each timenode
+            tf (float): Final time (s)
+            N (int): Number of integration steps
+
+        Returns:
+            states (np.ndarray): (num_states, N+1) array of propagated states
+        """
+
+        dt = tf / N
+        num_states = initial_state.shape[0]
+
+        states = np.zeros((num_states, N+1))
+        states[:, 0] = initial_state
+
+        for k in range(N):
+            states[:, k+1] = self._rk4_step(states[:, k], controls[:, k], dt)
+
+        return states
+
+    # TODO: ADD JIT
+    def _compute_accel_command(self, states: np.ndarray, r_target: np.ndarray, v_target: np.ndarray, t_go: float, N_pred: int) -> np.ndarray:
+        """
+        Calculates the commanded acceleration using the ZEM/ZEV feedback law.
+
+        Args:
+            states (np.ndarray): Current state vector [x, y, z, vx, vy, vz, m]
+            r_target (np.ndarray): Desired final position (m)
+            v_target (np.ndarray): Desired final velocity (m/s)
+            t_go (float): Time-to-go (s)
+            N_pred (int): Number of integration steps for ZEM/ZEV prediction
+
+        Returns:
+            a_cmd (np.ndarray): Commanded acceleration vector (m/s^2)
+        """
+
+        # Predict terminal state under zero thrust
+        zero_controls = np.zeros((3, N_pred+1)) # Zero control inputs for propagation
+        X_pred = self._propagate_states_rk4(states, zero_controls, t_go, N_pred)
+        r_pred = X_pred[0:3, -1]  # Predicted final position after propagating with zero control
+        v_pred = X_pred[3:6, -1]  # Predicted final velocity after propagating with zero control
+
+        # Calculate Zero-Effort-Miss (ZEM) and Zero-Effort-Velocity (ZEV) based on the predicted final state
+        zem = r_target - r_pred
+        zev = v_target - v_pred
+
+        # Apply control law
+        a_cmd = (6.0 / t_go**2) * zem - (2.0 / t_go) * zev
+
+        return a_cmd
+
+    # TODO: ADD JIT
+    def _saturate_accel_command(self, a_cmd: np.ndarray, m: float) -> np.ndarray:
+        """
+        Saturates the commanded acceleration based on the minimum and maximum thrust limits.
+
+        a_sat = {a                 if |a| <= T_max/m and |a| >= T_min/m,
+                {a * (T_min/m)/|a| if |a| < T_min/m,
+                {a * (T_max/m)/|a| if |a| > T_max/m
+
+        Args:
+            a_cmd (np.ndarray): Commanded acceleration vector (m/s^2)
+            m (float): Current mass of the vehicle (kg)
+
+        Returns:
+            a_cmd (np.ndarray): Saturated acceleration vector (m/s^2)
+        """
+
+        a_min = self.rocket_params['thrust_min'] / m
+        a_max = self.rocket_params['thrust_max'] / m
+
+        a_norm = np.linalg.norm(a_cmd)
+        if a_norm < 1e-6:
+            return np.zeros_like(a_cmd)
+
+        # Note: Using a lower bound can cause "chattering" in control if the commanded acceleration stays around the minimum threshold.
+        if a_norm < a_min:
+            a_sat = a_cmd * (a_min / a_norm)
+            return a_sat
+        elif a_norm > a_max:
+            a_sat = a_cmd * (a_max / a_norm)
+            return a_sat
+        else:
+            return a_cmd
+
+    # TODO: ADD JIT
+    def generate_trajectory(self, initial_conditions: dict, terminal_conditions: dict, t_final: float, N: int, N_pred: int) -> dict:
+        """
+        Generates a trajectory using the ZEM/ZEV guidance law.
+
+        Args:
+            initial_conditions (dict): Dictionary containing initial state parameters
+            terminal_conditions (dict): Dictionary containing terminal state parameters
+            t_final (float): Time of flight for the trajectory (s)
+            N (int): Number of simulation steps for trajectory generation
+            N_pred (int): Number of integration steps for ZEM/ZEV prediction
+
+        Returns:
+            trajectory (dict): Dictionary containing trajectory data for plotting and analysis
+        """
+
+        # Storage
+        t_hist = []
+        r_hist = []
+        v_hist = []
+        a_cmd_hist = []
+        m_hist = []
+
+        # Initial State
+        t = 0.0
+        r = np.array([initial_conditions['x0'], initial_conditions['y0'], initial_conditions['z0']])
+        v = np.array([initial_conditions['vx0'], initial_conditions['vy0'], initial_conditions['vz0']])
+        m = initial_conditions['m0']
+
+        # Target State
+        r_target = np.array([terminal_conditions['xf'], terminal_conditions['yf'], terminal_conditions['zf']])
+        v_target = np.array([terminal_conditions['vxf'], terminal_conditions['vyf'], terminal_conditions['vzf']])
+
+        # Compute/store node 0 (t=0)
+        t_go = t_final - t
+        states = np.concatenate((r, v, [m]))
+        a_cmd = self._compute_accel_command(states, r_target, v_target, t_go, N_pred)
+        a_cmd = self._saturate_accel_command(a_cmd, m)
+
+        t_hist.append(t)
+        r_hist.append(r.copy())
+        v_hist.append(v.copy())
+        a_cmd_hist.append(a_cmd.copy())
+        m_hist.append(m)
+
+        # Simulation time step (s)
+        dt = t_final / N
+
+        for k in range(N):
+            t_go = t_final - t
+
+            # TODO: Find a better way to handle the end of flight condition. Right now we just break the loop when t_go gets very small
+            # Guard against numerical issues at end of flight
+            if t_go < 0.001:
+                break
+
+            # Control law
+            states = np.concatenate((r, v, [m]))
+            a_cmd = self._compute_accel_command(states, r_target, v_target, t_go, N_pred)
+            a_cmd = self._saturate_accel_command(a_cmd, m)
+
+            # State propagation
+            X = self._rk4_step(states, m*a_cmd, dt)
+
+            r = X[0:3]
+            v = X[3:6]
+            m = X[6]
+            t = t + dt
+
+            t_hist.append(t)
+            r_hist.append(r.copy())
+            v_hist.append(v.copy())
+            a_cmd_hist.append(a_cmd.copy())
+            m_hist.append(m)
+
+        r_hist = np.asarray(r_hist, dtype=float)
+        v_hist = np.asarray(v_hist, dtype=float)
+        m_hist = np.asarray(m_hist, dtype=float)
+        a_cmd_hist = np.asarray(a_cmd_hist, dtype=float)
+        ux_hist = a_cmd_hist[:,0] * m_hist
+        uy_hist = a_cmd_hist[:,1] * m_hist
+        uz_hist = a_cmd_hist[:,2] * m_hist
+
+        # Final error check
+        pos_error = np.linalg.norm(r_hist[-1] - r_target)
+        vel_error = np.linalg.norm(v_hist[-1] - v_target)
+        print(f"Final position error: {pos_error:.2f} m")
+        print(f"Final velocity error: {vel_error:.2f} m/s")
+
+        return {
+            "success": True,
+            "iterations": 0,
+            "solve_time": 0,
+            "tf_opt": t_final,
+            "x_opt": r_hist[:,0],
+            "y_opt": r_hist[:,1],
+            "z_opt": r_hist[:,2],
+            "vx_opt": v_hist[:,0],
+            "vy_opt": v_hist[:,1],
+            "vz_opt": v_hist[:,2],
+            "m_opt": m_hist,
+            "ux_opt": ux_hist,
+            "uy_opt": uy_hist,
+            "uz_opt": uz_hist,
+            "gamma_opt": None
+        }
+
+    def find_best_trajectory(self, initial_conditions: dict, terminal_conditions: dict, t_min: float, t_max: float, t_tol: float, N: int, N_opt: int, N_pred: int) -> dict:
+        """
+        Performs a line search over the time of flight to find the trajectory that maximizes final mass (minimizes fuel consumption).
+
+        Args:
+            initial_conditions (dict): Dictionary containing initial state parameters
+            terminal_conditions (dict): Dictionary containing terminal state parameters
+            N (int): Number of simulation steps for trajectory generation during line search
+            N_opt (int): Number of simulation steps for final trajectory generation (more steps for smoother plots)
+            N_pred (int): Number of integration steps for ZEM/ZEV prediction
+            t_min (float): Minimum time of flight for line search
+            t_max (float): Maximum time of flight for line search
+            t_tol (float): Tolerance for time of flight optimization
+        """
+
+        print("\n--- Performing line search lowest cost trajectory ---")
+
+        def trajectory_cost(t_final: float) -> float:
+            trajectory = self.generate_trajectory(initial_conditions, terminal_conditions, t_final, N, N_pred)
+            cost = -trajectory['m_opt'][-1]
+            return cost  # Minimize negative final mass (maximize final mass)
+
+        result = minimize_scalar(trajectory_cost, method='bounded', bounds=(t_min, t_max), options={'xatol': t_tol, 'disp': 3})
+        t_opt = result.x
+        cost = result.fun
+
+        print(f"Optimal time of flight: {t_opt:.2f} s")
+        print(f"Cost function value: {cost:.2f} kg")
+
+        # Run final trajectory generation using the time of flight that produced the lowest cost trajectory
+        best_trajectory = self.generate_trajectory(initial_conditions, terminal_conditions, t_opt, N_opt, N_pred)
+
+        return best_trajectory
+
 # TODO: ADD JIT
 # TODO: Share dynamics across different trajectory optimization methods
-def state_dynamics(state, control, planet_params, rocket_params):
+def state_dynamics(state: np.array, control: np.array, planet_params: dict, rocket_params: dict) -> np.array:
     """
     Computes the time derivative of the state vector for a rocket under the influence of gravity, drag, and thrust.
 
@@ -57,253 +326,6 @@ def state_dynamics(state, control, planet_params, rocket_params):
 
     return np.array([dxdt, dydt, dzdt, dvxdt, dvydt, dvzdt, dmdt])
 
-# TODO: ADD JIT
-def rk4_step(dynamics_fn, state, control, planet_params, rocket_params, dt):
-    """
-    Perform a single RK4 integration step.
-
-    Args:
-        dynamics_fn (function): Function to compute state derivatives
-        state (np.array): Current state vector
-        control (np.array): Control input vector
-        planet_params (dict): Physical parameters
-        rocket_params (dict): Rocket parameters
-        dt (float): Time step (s)
-
-    Returns:
-        next_state (np.array): State vector after time step dt
-    """
-
-    k1 = dynamics_fn(state, control, planet_params, rocket_params)
-    k2 = dynamics_fn(state + 0.5 * dt * k1, control, planet_params, rocket_params)
-    k3 = dynamics_fn(state + 0.5 * dt * k2, control, planet_params, rocket_params)
-    k4 = dynamics_fn(state + dt * k3, control, planet_params, rocket_params)
-
-    next_state = state + (dt / 6.0) * (k1 + 2.0*k2 + 2.0*k3 + k4)
-    return next_state
-
-# TODO: ADD JIT
-def propagate_states_rk4(dynamics_fn, initial_state, controls, planet_params, rocket_params, tf, N):
-    """
-    Simulate the trajectory using RK4 integration with control inputs.
-
-    Args:
-        dynamics_fn (function): Function to compute state derivatives
-        initial_state (np.array): Array of system states at initial time
-        controls (np.array): Array of control inputs at each timenode
-        planet_params (dict): Physical parameters
-        rocket_params (dict): Rocket parameters
-        tf (float): Final time (s)
-        N (int): Number of integration steps
-
-    Returns:
-        states (np.array): (num_states, N+1) array of propagated states
-    """
-
-    dt = tf / N
-    num_states = initial_state.shape[0]
-
-    states = np.zeros((num_states, N+1))
-    states[:, 0] = initial_state
-
-    for k in range(N):
-        states[:, k+1] = rk4_step(dynamics_fn, states[:, k], controls[:, k], planet_params, rocket_params, dt)
-
-    return states
-
-# TODO: ADD JIT
-def zem_zev_guidance(dynamics_fn, states, r_target, v_target, t_go, planet_params, rocket_params):
-    """
-    Calculates the commanded acceleration using the ZEM/ZEV feedback law.
-
-    Args:
-        dynamics_fn (function): Function to compute state derivatives
-        states (np.array): Current state vector [x, y, z, vx, vy, vz, m]
-        r_target (np.array): Desired final position (m)
-        v_target (np.array): Desired final velocity (m/s)
-        t_go (float): Time-to-go (s)
-        planet_params (dict): Physical parameters
-        rocket_params (dict): Rocket parameters
-
-    Returns:
-        a_cmd (np.array): Commanded acceleration vector (m/s^2)
-    """
-
-    # Calculate Zero-Effort-Miss (ZEM) and Zero-Effort-Velocity (ZEV) based on the predicted final state
-    N = 10 # Number of steps to propagate with zero control for ZEM/ZEV calculation
-    zero_controls = np.zeros((3, N+1)) # Zero control inputs for propagation
-    X = propagate_states_rk4(dynamics_fn, states, zero_controls, planet_params, rocket_params, t_go, N)
-    r_pred = X[0:3, -1]  # Predicted final position after propagating with zero control
-    v_pred = X[3:6, -1]  # Predicted final velocity after propagating with zero control
-
-    zem = r_target - r_pred
-    zev = v_target - v_pred
-
-    # Apply control law
-    a_cmd = (6.0 / t_go**2) * zem - (2.0 / t_go) * zev
-
-    return a_cmd
-
-def saturate_thrust_accel(a_cmd, m, T_min, T_max):
-    """
-    Saturates the commanded acceleration based on the minimum and maximum thrust limits.
-
-    Args:
-        a_cmd (np.array): Commanded acceleration vector (m/s^2)
-        m (float): Current mass of the vehicle (kg)
-        T_min (float): Minimum thrust (N)
-        T_max (float): Maximum thrust (N)
-
-    Returns:
-        a_cmd (np.array): Saturated acceleration vector (m/s^2)
-    """
-   # T_max/m is the maximum acceleration magnitude
-   # a_sat = {a                 if |a| <= T_max/m and |a| >= T_min/m,
-   #         {a * (T_min/m)/|a| if |a| < T_min/m,
-   #         {a * (T_max/m)/|a| if |a| > T_max/m
-
-    a_min = T_min / m
-    a_max = T_max / m
-
-    a_norm = np.linalg.norm(a_cmd)
-    if a_norm < 1e-8:
-        return np.zeros_like(a_cmd)
-
-    # Note: Using a lower bound can cause "chattering" in control if the commanded acceleration stays around the minimum threshold.
-    if a_norm < a_min:
-        a_sat = a_cmd * (a_min / a_norm)
-        return a_sat
-    elif a_norm > a_max:
-        a_sat = a_cmd * (a_max / a_norm)
-        return a_sat
-    else:
-        return a_cmd
-
-def run_simulation(initial_conditions, terminal_conditions, planet_params, rocket_params, N, t_final):
-    """
-    Runs the trajectory simulation for a specific flight time.
-    """
-
-    dt = t_final / N  # Simulation time step (s)
-
-    # Vehicle Parameters
-    T_min = rocket_params['thrust_min'] # Minimum thrust (N)
-    T_max = rocket_params['thrust_max'] # Maximum thrust (N)
-
-    # Storage
-    t_hist = []
-    r_hist = []
-    v_hist = []
-    a_cmd_hist = []
-    m_hist = []
-
-    # Initial State
-    t = 0
-    r = np.array([initial_conditions['x0'], initial_conditions['y0'], initial_conditions['z0']])
-    v = np.array([initial_conditions['vx0'], initial_conditions['vy0'], initial_conditions['vz0']])
-    m = initial_conditions['m0']
-
-    # Target State
-    r_f = np.array([terminal_conditions['xf'], terminal_conditions['yf'], terminal_conditions['zf']])
-    v_f = np.array([terminal_conditions['vxf'], terminal_conditions['vyf'], terminal_conditions['vzf']])
-
-    # Compute/store node 0 (t=0)
-    t_go = t_final - t
-    states = np.concatenate((r, v, [m]))
-    a_cmd = zem_zev_guidance(state_dynamics, states, r_f, v_f, t_go, planet_params, rocket_params)
-    a_cmd = saturate_thrust_accel(a_cmd, m, T_min, T_max)
-
-    t_hist.append(t)
-    r_hist.append(r.copy())
-    v_hist.append(v.copy())
-    a_cmd_hist.append(a_cmd.copy())
-    m_hist.append(m)
-
-    for k in range(N):
-        t_go = t_final - t
-
-        # Guard against numerical issues at end of flight
-        if t_go < 0.001:
-            break
-
-        # Control law
-        states = np.concatenate((r, v, [m]))
-        a_cmd = zem_zev_guidance(state_dynamics, states, r_f, v_f, t_go, planet_params, rocket_params)
-        a_cmd = saturate_thrust_accel(a_cmd, m, T_min, T_max)
-
-        # State propagation
-        X = rk4_step(state_dynamics, states, m*a_cmd, planet_params, rocket_params, dt)
-
-        r = X[0:3]
-        v = X[3:6]
-        m = X[6]
-        t = t + dt
-
-        # Store Data
-        t_hist.append(t)
-        r_hist.append(r.copy())
-        v_hist.append(v.copy())
-        a_cmd_hist.append(a_cmd.copy())
-        m_hist.append(m)
-
-    # Final error check
-    pos_error = np.linalg.norm(r - r_f)
-    vel_error = np.linalg.norm(v - v_f)
-    print(f"Final position error: {pos_error:.2f} m")
-    print(f"Final velocity error: {vel_error:.2f} m/s")
-
-    r_hist = np.asarray(r_hist, dtype=float)
-    v_hist = np.asarray(v_hist, dtype=float)
-    m_hist = np.asarray(m_hist, dtype=float)
-    a_cmd_hist = np.asarray(a_cmd_hist, dtype=float)
-    ux_hist = a_cmd_hist[:,0] * m_hist
-    uy_hist = a_cmd_hist[:,1] * m_hist
-    uz_hist = a_cmd_hist[:,2] * m_hist
-
-    return {
-        "success": True,
-        "iterations": 0,
-        "solve_time": 0,
-        "tf_opt": t_final,
-        "x_opt": r_hist[:,0],
-        "y_opt": r_hist[:,1],
-        "z_opt": r_hist[:,2],
-        "vx_opt": v_hist[:,0],
-        "vy_opt": v_hist[:,1],
-        "vz_opt": v_hist[:,2],
-        "m_opt": m_hist,
-        "ux_opt": ux_hist,
-        "uy_opt": uy_hist,
-        "uz_opt": uz_hist,
-        "gamma_opt": None
-    }
-
-def find_optimal_time(initial_conditions, terminal_conditions, planet_params, rocket_params, N, t_min, t_max):
-    print("\n--- Performing line search for optimal time of flight ---")
-
-    def cost_function(t_final):
-        result = run_simulation(initial_conditions, terminal_conditions, planet_params, rocket_params, N, t_final)
-        final_mass = result['m_opt'][-1]
-        return -final_mass  # maximize final mass (minimize negative final mass)
-
-    result = minimize_scalar(cost_function, method='bounded', bounds=(t_min, t_max), options={'xatol': 1.0, 'disp': 3})
-    t_opt = result.x
-    cost = result.fun
-
-    print(f"Optimal time of flight: {t_opt:.2f} s")
-    print(f"Cost function value: {cost:.2f} kg")
-
-    return t_opt
-
-def run_optimization(initial_conditions, terminal_conditions, planet_params, rocket_params, N_opt, N_final, t_min, t_max):
-    # Optimize
-    t_opt = find_optimal_time(initial_conditions, terminal_conditions, planet_params, rocket_params, N_opt, t_min, t_max)
-
-    # Run final simulation using the optimal time of flight found from the line search
-    result = run_simulation(initial_conditions, terminal_conditions, planet_params, rocket_params, N_final, t_opt)
-
-    return result
-
 def main():
     # TODO: Share parameters and initial conditions across different trajectory optimization methods for easier comparison
 
@@ -339,10 +361,12 @@ def main():
     }
 
     num_runs = 1
-    N_opt = 50 # Number of simulation steps
-    N_final = 10*N_opt # Number of steps for final simulation (more steps for smoother plots)
-    t_min = 10.0 # Minimum time of flight (s)
-    t_max = 500.0 # Maximum time of flight (s)
+    N = 50 # Number of integration steps in generated trajectories during line search
+    N_opt = 10*N # Number of integration steps in final optimized trajectory
+    N_pred = 10 # Number of integration steps for ZEM/ZEV prediction
+    t_min = 10.0 # Minimum time of flight in line search (s)
+    t_max = 500.0 # Maximum time of flight in line search (s)
+    t_tol = 1.0 # Optimal time of flight tolerance in line search (s)
 
     np.random.seed(8)
     results = []
@@ -367,11 +391,12 @@ def main():
         # initial_conditions = {'x0': 31116.18834065397, 'y0': 28482.906354009217, 'z0': 6449458.003926393, 'vx0': 634.4300909114133, 'vy0': 76.80522338545347, 'vz0': -192.1010130966052, 'm0': 75000.0}
         # initial_conditions = {'x0': -1481.8618443154555, 'y0': 28626.116533809356, 'z0': 6437017.691213863, 'vx0': 103.67629902591716, 'vy0': 725.7214163473893, 'vz0': -67.99194802672406, 'm0': 75000.0}
 
-        result = run_optimization(initial_conditions, terminal_conditions, planet_params, rocket_params, N_opt, N_final, t_min, t_max)
+        zem_zev_traj_gen = ZEMZEVTrajectoryGenerator(planet_params, rocket_params, state_dynamics)
+        result = zem_zev_traj_gen.find_best_trajectory(initial_conditions, terminal_conditions, t_min, t_max, t_tol, N, N_opt, N_pred)
         results.append(result)
 
     if (num_runs == 1):
-        traj_plot.plot_single_run(results[0], N_final, planet_params['R'])
+        traj_plot.plot_single_run(results[0], N_opt, planet_params['R'])
         # comparison = traj_val.compare_optimized_vs_simulated_trajectories(dynamics_np, initial_conditions, results[0], planet_params, rocket_params, N_opt)
         # traj_val.plot_trajectory_comparison(results[0], comparison, N_opt)
     if (num_runs > 1):
