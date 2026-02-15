@@ -17,6 +17,7 @@ from time import time
 
 import trajectory_validation as traj_val
 import trajectory_plotting as traj_plot
+from zem_zev_guidance import ZEMZEVTrajectoryGenerator
 
 def dynamics_scaled(state_scaled, control_scaled, planet_params, rocket_params, bounds, scale_factors, offsets):
     """
@@ -292,29 +293,74 @@ def run_optimization(initial_conditions, terminal_conditions, planet_params, roc
     # Dynamic equality constraints
     add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, planet_params, rocket_params, bounds, scale_factors, offsets, N)
 
-    # Initial guess solution: Linear interpolation between boundary conditions for states, min thrust for controls
-    for i in range(N+1):
-        # Linear interpolation initial guess for states
-        t_frac = i / N
-        opti.set_initial(x_scaled[i], (1-t_frac)*x0_scaled + t_frac*xf_scaled)
-        opti.set_initial(y_scaled[i], (1-t_frac)*y0_scaled + t_frac*yf_scaled)
-        opti.set_initial(z_scaled[i], (1-t_frac)*z0_scaled + t_frac*zf_scaled)
-        opti.set_initial(vx_scaled[i], (1-t_frac)*vx0_scaled + t_frac*vxf_scaled)
-        opti.set_initial(vy_scaled[i], (1-t_frac)*vy0_scaled + t_frac*vyf_scaled)
-        opti.set_initial(vz_scaled[i], (1-t_frac)*vz0_scaled + t_frac*vzf_scaled)
-        opti.set_initial(m_scaled[i], (1-t_frac)*m0_scaled + t_frac*mf_scaled)
+    # Use ZEM/ZEV guidance law to generate an initial guess trajectory for the constrained trajectory optimization
+    zem_zev_traj_gen = ZEMZEVTrajectoryGenerator(planet_params, rocket_params, dynamics_np)
+    N = 50 # Number of integration steps in generated trajectories during line search
+    k = 1 # Factor to increase number of integration steps for final trajectory once optimal time of flight is found in line search
+    N_final = k*N # Number of integration steps for final trajectory validation and plotting
+    N_pred = 10 # Number of integration steps for ZEM/ZEV prediction
+    t_min = 10.0 # Minimum time of flight in line search (s)
+    t_max = 500.0 # Maximum time of flight in line search (s)
+    t_tol = 1.0 # Optimal time of flight tolerance in line search (s)
+    r_tol = 100.0 # Only require roughly correct terminal position for initial guess, since optimization will refine it
+    v_tol = 100.0 # Only require roughly correct terminal velocity for initial guess, since optimization will refine it
+    zem_zev_trajectory = zem_zev_traj_gen.find_best_trajectory(initial_conditions, terminal_conditions, t_min, t_max, t_tol, r_tol, v_tol, N, N_final, N_pred)
 
-        # Min thrust initial guess for controls
-        opti.set_initial(ux_scaled[i], u_min_scaled)
-        opti.set_initial(uy_scaled[i], u_min_scaled)
-        opti.set_initial(uz_scaled[i], u_min_scaled)
-        opti.set_initial(gamma_scaled[i], u_min_scaled)
+    if (zem_zev_trajectory['success']):
+        print("Valid ZEM/ZEV trajectory found with time of flight:", zem_zev_trajectory['tf_opt'])
+
+        stride = k # Sub-sample the ZEM/ZEV trajectory to match the number of optimization nodes (N+1)
+        x_guess = zem_zev_trajectory['x_opt'][::stride]
+        y_guess = zem_zev_trajectory['y_opt'][::stride]
+        z_guess = zem_zev_trajectory['z_opt'][::stride]
+        vx_guess = zem_zev_trajectory['vx_opt'][::stride]
+        vy_guess = zem_zev_trajectory['vy_opt'][::stride]
+        vz_guess = zem_zev_trajectory['vz_opt'][::stride]
+        m_guess = zem_zev_trajectory['m_opt'][::stride]
+        ux_guess = zem_zev_trajectory['ux_opt'][::stride]
+        uy_guess = zem_zev_trajectory['uy_opt'][::stride]
+        uz_guess = zem_zev_trajectory['uz_opt'][::stride]
+        gamma_guess = np.sqrt(ux_guess**2 + uy_guess**2 + uz_guess**2)
+        tf_guess = zem_zev_trajectory['tf_opt']
+
+        # Initial guess solution: Use ZEM/ZEV trajectory for states, controls and final time
+        opti.set_initial(x_scaled, (x_guess - offsets['x']) / scale_factors['x'])
+        opti.set_initial(y_scaled, (y_guess - offsets['y']) / scale_factors['y'])
+        opti.set_initial(z_scaled, (z_guess - offsets['z']) / scale_factors['z'])
+        opti.set_initial(vx_scaled, (vx_guess - offsets['vx']) / scale_factors['vx'])
+        opti.set_initial(vy_scaled, (vy_guess - offsets['vy']) / scale_factors['vy'])
+        opti.set_initial(vz_scaled, (vz_guess - offsets['vz']) / scale_factors['vz'])
+        opti.set_initial(m_scaled, (m_guess - offsets['m']) / scale_factors['m'])
+        opti.set_initial(ux_scaled, (ux_guess - offsets['ux']) / scale_factors['ux'])
+        opti.set_initial(uy_scaled, (uy_guess - offsets['uy']) / scale_factors['uy'])
+        opti.set_initial(uz_scaled, (uz_guess - offsets['uz']) / scale_factors['uz'])
+        opti.set_initial(gamma_scaled, (gamma_guess - offsets['gamma']) / scale_factors['gamma'])
+        opti.set_initial(tf_scaled, (tf_guess - offsets['t']) / scale_factors['t'])
+    else:
+        print("Valid ZEM/ZEV trajectory not found, using linear interpolation initial guess instead")
+        # Initial guess solution: Linear interpolation between boundary conditions for states, and min thrust for controls
+        for i in range(N+1):
+            # Linear interpolation initial guess for states
+            t_frac = i / N
+            opti.set_initial(x_scaled[i], (1-t_frac)*x0_scaled + t_frac*xf_scaled)
+            opti.set_initial(y_scaled[i], (1-t_frac)*y0_scaled + t_frac*yf_scaled)
+            opti.set_initial(z_scaled[i], (1-t_frac)*z0_scaled + t_frac*zf_scaled)
+            opti.set_initial(vx_scaled[i], (1-t_frac)*vx0_scaled + t_frac*vxf_scaled)
+            opti.set_initial(vy_scaled[i], (1-t_frac)*vy0_scaled + t_frac*vyf_scaled)
+            opti.set_initial(vz_scaled[i], (1-t_frac)*vz0_scaled + t_frac*vzf_scaled)
+            opti.set_initial(m_scaled[i], (1-t_frac)*m0_scaled + t_frac*mf_scaled)
+
+            # Min thrust initial guess for controls
+            opti.set_initial(ux_scaled[i], u_min_scaled)
+            opti.set_initial(uy_scaled[i], u_min_scaled)
+            opti.set_initial(uz_scaled[i], u_min_scaled)
+            opti.set_initial(gamma_scaled[i], u_min_scaled)
+
+        # Initial guess for time horizon
+        opti.set_initial(tf_scaled, (t_min_scaled + t_max_scaled) / 2.0)
 
     # Initialize slack on surface constraint to zero
     opti.set_initial(slack_surface, 0.0)
-
-    # Initial guess for time horizon
-    opti.set_initial(tf_scaled, (t_min_scaled + t_max_scaled) / 2.0)
 
     # Objective function: Maximize final mass (by minimizing fuel use) AND minimize slack
     # NOTE: Using slack variables on position and velocity seemed to worsen convergence. Better to use tolerances on terminal constraints.
@@ -484,7 +530,7 @@ def main():
     }
 
     N = 50 # Number of control intervals
-    num_runs = 1 # Number of randomized runs to perform
+    num_runs = 100 # Number of randomized runs to perform
 
     results = []
     failed_initial_conditions = []
