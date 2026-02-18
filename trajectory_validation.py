@@ -73,13 +73,13 @@ def compare_optimized_vs_simulated_trajectories(dynamics_fn, initial_state, opti
     uz_opt = optimized_trajectory["uz_opt"]
 
     # Extract initial state
-    X0 = np.array([initial_state['x0'],
-                   initial_state['y0'],
-                   initial_state['z0'],
-                   initial_state['vx0'],
-                   initial_state['vy0'],
-                   initial_state['vz0'],
-                   initial_state['m0']])
+    X0 = np.array([initial_state['x'],
+                   initial_state['y'],
+                   initial_state['z'],
+                   initial_state['vx'],
+                   initial_state['vy'],
+                   initial_state['vz'],
+                   initial_state['m']])
 
     # Simulate trajectory using RK4
     u_opt = np.vstack([ux_opt, uy_opt, uz_opt])

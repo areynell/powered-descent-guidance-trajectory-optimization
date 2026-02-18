@@ -2,55 +2,70 @@
 # 0) Plot planet's surface near landing site, and add linear surface constraint instead of radial constraint
 # 1) Split path constraints, initial guesses, and objective function into separate functions for clarity
 # 2) Add glide-slope constraint near landing site
-# 3) Change vehicle's mass, thrust and surface area to be more realistic
-# 4) Make 2D animation of trajectory and control input
-# 5) Use polynomial trajectories for state and controls that match collocation method
-# 6) Plot midpoints as well
-# 7) Try different collocation methods
-# 8) Add rotation of planet
-# 9) Re-order functions to make reading flow easier
-# 10) Add 6-DOF dynamics
+# 3) Make 2D animation of trajectory and control input
+# 4) Use polynomial trajectories for state and controls that match collocation method
+# 5) Plot midpoints as well
+# 6) Try different collocation methods
+# 7) Add rotation of planet
+# 8) Re-order functions to make reading flow easier
+# 9) Add 6-DOF dynamics
 
+from enum import IntEnum
 import numpy as np
 import casadi as ca
 from time import time
 
 import trajectory_validation as traj_val
 import trajectory_plotting as traj_plot
-from zem_zev_guidance import ZEMZEVTrajectoryGenerator
+from zem_zev_guidance import ZEMZEVPoweredDescentGuidance
+
+class State(IntEnum):
+    X = 0
+    Y = 1
+    Z = 2
+    VX = 3
+    VY = 4
+    VZ = 5
+    M = 6
+
+class Control(IntEnum):
+    X = 0
+    Y = 1
+    Z = 2
+    GAMMA = 3 # Thrust magnitude slack variable for convex relaxation
 
 def dynamics_scaled(state_scaled, control_scaled, planet_params, rocket_params, bounds, scale_factors, offsets):
     """
     Scaled dynamics in non-dimensional units.
     state = [x, y, z, vx, vy, vz, m] (scaled)
-    control = [ux, uy, uz] (scaled)
+    control = [ux, uy, uz, gamma] (scaled)
     returns scaled derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt, dvz/dt, dm/dt]
     computed by unscaling the inputs, calling dynamics(), and rescaling the outputs.
     """
     T = scale_factors['t']
-    S_x = ca.vertcat(scale_factors['x'],
+    S_x = np.vstack((scale_factors['x'],
                      scale_factors['y'],
                      scale_factors['z'],
                      scale_factors['vx'],
                      scale_factors['vy'],
                      scale_factors['vz'],
-                     scale_factors['m'])
-    S_u = ca.vertcat(scale_factors['ux'],
+                     scale_factors['m']))
+    S_u = np.vstack((scale_factors['ux'],
                      scale_factors['uy'],
                      scale_factors['uz'],
-                     scale_factors['gamma'])
+                     scale_factors['gamma']))
 
-    x_offsets = ca.vertcat(offsets['x'],
+    x_offsets = np.vstack((offsets['x'],
                            offsets['y'],
                            offsets['z'],
                            offsets['vx'],
                            offsets['vy'],
                            offsets['vz'],
-                           offsets['m'])
-    u_offsets = ca.vertcat(offsets['ux'],
+                           offsets['m']))
+    u_offsets = np.vstack((offsets['ux'],
                            offsets['uy'],
                            offsets['uz'],
-                           offsets['gamma'])
+                           offsets['gamma']))
 
     x_scaled = state_scaled
     u_scaled = control_scaled
@@ -103,18 +118,18 @@ def dynamics_ca(state, control, planet_params, rocket_params):
     control = [ux, uy, uz, gamma]
     returns derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt, dvz/dt, dm/dt]
     """
-    x = state[0]
-    y = state[1]
-    z = state[2]
-    vx = state[3]
-    vy = state[4]
-    vz = state[5]
-    m = state[6]
+    x = state[State.X]
+    y = state[State.Y]
+    z = state[State.Z]
+    vx = state[State.VX]
+    vy = state[State.VY]
+    vz = state[State.VZ]
+    m = state[State.M]
 
-    ux = control[0]
-    uy = control[1]
-    uz = control[2]
-    gamma = control[3]
+    ux = control[Control.X]
+    uy = control[Control.Y]
+    uz = control[Control.Z]
+    gamma = control[Control.GAMMA]
 
     G = planet_params['G']
     M = planet_params['M']
@@ -127,11 +142,11 @@ def dynamics_ca(state, control, planet_params, rocket_params):
     Aref = rocket_params['Aref']
     Cd = rocket_params['Cd']
 
-    r = ca.sqrt(x**2 + y**2 + z**2)
+    r = np.sqrt(x**2 + y**2 + z**2)
     h = r - R
-    rho = rho0 * ca.exp(-h / H)
+    rho = rho0 * np.exp(-h / H)
     eps = 1e-8
-    v = ca.sqrt(vx**2 + vy**2 + vz**2 + eps)
+    v = np.sqrt(vx**2 + vy**2 + vz**2 + eps)
     D = -0.5 * rho * Cd * Aref * v * ca.vertcat(vx, vy, vz)
     Dx = D[0]
     Dy = D[1]
@@ -147,335 +162,425 @@ def dynamics_ca(state, control, planet_params, rocket_params):
 
     return ca.vertcat(dxdt, dydt, dzdt, dvxdt, dvydt, dvzdt, dmdt)
 
-def add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, planet_params, rocket_params, bounds, scale_factors, offsets, N):
-    """
-    Add dynamic constraints using Hermite-Simpson collocation.
-    """
+class HermiteSimpsonPoweredDescentGuidance:
+    def __init__(self, planet_params: dict, rocket_params: dict, state_dynamics_func: callable):
+        self.planet_params = planet_params
+        self.rocket_params = rocket_params
+        self.state_dynamics_func = state_dynamics_func
 
-    for k in range(N):
-        xk = X_scaled[:, k]
-        uk = U_scaled[:, k]
-        xk_next = X_scaled[:, k+1]
-        uk_next = U_scaled[:, k+1]
+        self.opti = None
+        self.opt_vars_scaled = None
 
-        # Dynamics at beginning and end of interval
-        fk = dynamics_scaled(xk, uk, planet_params, rocket_params, bounds, scale_factors, offsets)
-        fk_next = dynamics_scaled(xk_next, uk_next, planet_params, rocket_params, bounds, scale_factors, offsets)
+        self.scale_factors = None
+        self.offsets = None
+        self.initial_conditions = None
+        self.initial_conditions_scaled = None
+        self.terminal_conditions = None
+        self.terminal_conditions_scaled = None
+        self.landing_tolerances = None
+        self.landing_tolerances_scaled = None
+        self.bounds = None
+        self.bounds_scaled = None
+        self.N = None
 
-        # Midpoint state (Hermite interpolation)
-        xk_mid = 0.5 * (xk + xk_next) + (dt_scaled/8.0) * (fk - fk_next)
+    def generate_trajectory(self, initial_conditions: dict, terminal_conditions: dict, bounds: dict, landing_tolerances: dict, scale_factors: dict, offsets: dict, N: int):
+        """
+        Main entry point to solve the trajectory.
+        """
 
-        # Midpoint control (linear interpolation)
-        uk_mid = 0.5 * (uk + uk_next)
+        self.opti = ca.Opti()
+        self.initial_conditions = initial_conditions
+        self.terminal_conditions = terminal_conditions
+        self.bounds = bounds
+        self.scale_factors = scale_factors
+        self.offsets = offsets
+        self.N = N
 
-        # Dynamics at midpoint
-        fk_mid = dynamics_scaled(xk_mid, uk_mid, planet_params, rocket_params, bounds, scale_factors, offsets)
+        # Creating scaled variables to improve convergence
+        self.opt_vars_scaled = self._create_scaled_optimization_variables()
+        self.initial_conditions_scaled = self._scale_state(initial_conditions, scale_factors, offsets)
+        self.terminal_conditions_scaled = self._scale_state(terminal_conditions, scale_factors, offsets)
+        self.bounds_scaled = self._scale_bounds(bounds, scale_factors, offsets)
+        self.landing_tolerances_scaled = self._scale_landing_tolerances(landing_tolerances, scale_factors)
 
-        # Simpson integration
-        opti.subject_to(xk_next == xk + (dt_scaled/6.0) * (fk + 4.0*fk_mid + fk_next))
+        self._add_boundary_constraints()
+        self._add_path_constraints()
+        self._add_hermite_simpson_dynamic_constraints()
+        self._add_objective_function()
+        self._compute_initial_solution_guess()
 
-def run_optimization(initial_conditions, terminal_conditions, planet_params, rocket_params, bounds, landing_tolerances, scale_factors, offsets, N):
-    """
-    Set up the objective function and constraints, and solve a single trajectory optimization problem.
-    """
+        return self._solve()
 
-    # State dimensions
-    num_states = 7  # [x, y, z, vx, vy, vz, m]
-    num_controls = 4  # [ux, uy, uz, gamma]
+    def _create_scaled_optimization_variables(self):
+        # Scaled state variables = [x, y, z, vx, vy, vz, m]
+        num_states = 7
 
-    # Scaled initial conditions
-    x0_scaled = (initial_conditions['x0'] - offsets['x']) / scale_factors['x']
-    y0_scaled = (initial_conditions['y0'] - offsets['y']) / scale_factors['y']
-    z0_scaled = (initial_conditions['z0'] - offsets['z']) / scale_factors['z']
-    vx0_scaled = (initial_conditions['vx0'] - offsets['vx']) / scale_factors['vx']
-    vy0_scaled = (initial_conditions['vy0'] - offsets['vy']) / scale_factors['vy']
-    vz0_scaled = (initial_conditions['vz0'] - offsets['vz']) / scale_factors['vz']
-    m0_scaled = (initial_conditions['m0'] - offsets['m']) / scale_factors['m']
+        # Scaled control variables = [ux, uy, uz, gamma]
+        # NOTE: Gamma is a thrust magnitude slack variable for convex relaxation
+        num_controls = 4
 
-    # Scaled terminal conditions
-    xf_scaled = (terminal_conditions['xf'] - offsets['x']) / scale_factors['x']
-    yf_scaled = (terminal_conditions['yf'] - offsets['y']) / scale_factors['y']
-    zf_scaled = (terminal_conditions['zf'] - offsets['z']) / scale_factors['z']
-    vxf_scaled = (terminal_conditions['vxf'] - offsets['vx']) / scale_factors['vx']
-    vyf_scaled = (terminal_conditions['vyf'] - offsets['vy']) / scale_factors['vy']
-    vzf_scaled = (terminal_conditions['vzf'] - offsets['vz']) / scale_factors['vz']
-    mf_scaled = (terminal_conditions['mf'] - offsets['m']) / scale_factors['m']
-
-    # Scaled control bounds
-    u_min_scaled = (bounds['u_min'] - offsets['gamma']) / scale_factors['gamma']
-    u_max_scaled = (bounds['u_max'] - offsets['gamma']) / scale_factors['gamma']
-
-    # Scaled time horizon bounds
-    t_min_scaled = (bounds['t_min'] - offsets['t']) / scale_factors['t']
-    t_max_scaled = (bounds['t_max'] - offsets['t']) / scale_factors['t']
-
-    # Scaled position and velocity tolerances for terminal constraints
-    x_tol_scaled = landing_tolerances['x_tol'] / scale_factors['x']
-    y_tol_scaled = landing_tolerances['y_tol'] / scale_factors['y']
-    z_tol_scaled = landing_tolerances['z_tol'] / scale_factors['z']
-    vx_tol_scaled = landing_tolerances['vx_tol'] / scale_factors['vx']
-    vy_tol_scaled = landing_tolerances['vy_tol'] / scale_factors['vy']
-    vz_tol_scaled = landing_tolerances['vz_tol'] / scale_factors['vz']
-
-    # Optimization variables
-    opti = ca.Opti()
-
-    # Scaled state variables
-    X_scaled = opti.variable(num_states, N+1)
-    x_scaled = X_scaled[0, :]
-    y_scaled = X_scaled[1, :]
-    z_scaled = X_scaled[2, :]
-    vx_scaled = X_scaled[3, :]
-    vy_scaled = X_scaled[4, :]
-    vz_scaled = X_scaled[5, :]
-    m_scaled = X_scaled[6, :]
-
-    # Scaled control variables
-    U_scaled = opti.variable(num_controls, N+1)
-    ux_scaled = U_scaled[0, :]
-    uy_scaled = U_scaled[1, :]
-    uz_scaled = U_scaled[2, :]
-    gamma_scaled = U_scaled[3, :] # Thrust magnitude slack variable for convex relaxation
-
-    # Scaled final time
-    tf_scaled = opti.variable()
-    # Time step
-    # NOTE: Is there a better way we can incorporate a free final time? "tdot = 1" or "time scaling"?
-    dt_scaled = tf_scaled / N
-
-    # Slack variable for surface constraint
-    slack_surface = opti.variable(1, N+1)
-
-    # Initial state constraints
-    opti.subject_to(x_scaled[0] == x0_scaled)
-    opti.subject_to(y_scaled[0] == y0_scaled)
-    opti.subject_to(z_scaled[0] == z0_scaled)
-    opti.subject_to(vx_scaled[0] == vx0_scaled)
-    opti.subject_to(vy_scaled[0] == vy0_scaled)
-    opti.subject_to(vz_scaled[0] == vz0_scaled)
-    opti.subject_to(m_scaled[0] == m0_scaled)
-
-    # Final state constraints
-    opti.subject_to(opti.bounded(xf_scaled - x_tol_scaled, x_scaled[-1], xf_scaled + x_tol_scaled))
-    opti.subject_to(opti.bounded(yf_scaled - y_tol_scaled, y_scaled[-1], yf_scaled + y_tol_scaled))
-    opti.subject_to(opti.bounded(zf_scaled - z_tol_scaled, z_scaled[-1], zf_scaled + z_tol_scaled))
-    opti.subject_to(opti.bounded(vxf_scaled - vx_tol_scaled, vx_scaled[-1], vxf_scaled + vx_tol_scaled))
-    opti.subject_to(opti.bounded(vyf_scaled - vy_tol_scaled, vy_scaled[-1], vyf_scaled + vy_tol_scaled))
-    opti.subject_to(opti.bounded(vzf_scaled - vz_tol_scaled, vz_scaled[-1], vzf_scaled + vz_tol_scaled))
-
-    # Time constraints
-    opti.subject_to(opti.bounded(t_min_scaled, tf_scaled, t_max_scaled))
-
-    # Path constraints
-    # Keep vehicle above surface (r >= R), using physical units since x and y scales might differ
-    x_phys = x_scaled * scale_factors['x'] + offsets['x']
-    y_phys = y_scaled * scale_factors['y'] + offsets['y']
-    z_phys = z_scaled * scale_factors['z'] + offsets['z']
-    # IMPORTANT: Normalizing by R to keep gradients well-scaled (r >= R => r/R >= 1), and using slack variable to improve convergence
-    opti.subject_to(slack_surface >= 0)
-    opti.subject_to(ca.sqrt(x_phys**2 + y_phys**2 + z_phys**2) / planet_params['R'] >= 1.0 - slack_surface)
-
-    # Control constraints
-    opti.subject_to(opti.bounded(-u_max_scaled, ux_scaled, u_max_scaled))
-    opti.subject_to(opti.bounded(-u_max_scaled, uy_scaled, u_max_scaled))
-    opti.subject_to(opti.bounded(-u_max_scaled, uz_scaled, u_max_scaled))
-    # Convex relaxation of thrust magnitude
-    opti.subject_to(ux_scaled**2 + uy_scaled**2 + uz_scaled**2 <= gamma_scaled**2)
-    opti.subject_to(opti.bounded(u_min_scaled, gamma_scaled, u_max_scaled))
-
-    # Mass constraints
-    opti.subject_to(m_scaled >= mf_scaled)  # Keep mass above dry-mass lower bound everywhere
-    # NOTE: This constraint really seems to help produce faster convergence and avoid infeasible solutions, why?
-    for k in range(N):
-        # Mass cannot increase over time
-        opti.subject_to(m_scaled[k+1] <= m_scaled[k])
-
-    # Dynamic equality constraints
-    add_hermite_simpson_dynamic_constraints(opti, X_scaled, U_scaled, dt_scaled, planet_params, rocket_params, bounds, scale_factors, offsets, N)
-
-    # Use ZEM/ZEV guidance law to generate an initial guess trajectory for the constrained trajectory optimization
-    zem_zev_traj_gen = ZEMZEVTrajectoryGenerator(planet_params, rocket_params, dynamics_np)
-    N = 50 # Number of integration steps in generated trajectories during line search
-    k = 1 # Factor to increase number of integration steps for final trajectory once optimal time of flight is found in line search
-    N_final = k*N # Number of integration steps for final trajectory validation and plotting
-    N_pred = 10 # Number of integration steps for ZEM/ZEV prediction
-    t_min = 10.0 # Minimum time of flight in line search (s)
-    t_max = 500.0 # Maximum time of flight in line search (s)
-    t_tol = 1.0 # Optimal time of flight tolerance in line search (s)
-    r_tol = 100.0 # Only require roughly correct terminal position for initial guess, since optimization will refine it
-    v_tol = 100.0 # Only require roughly correct terminal velocity for initial guess, since optimization will refine it
-    zem_zev_trajectory = zem_zev_traj_gen.find_best_trajectory(initial_conditions, terminal_conditions, t_min, t_max, t_tol, r_tol, v_tol, N, N_final, N_pred)
-
-    if (zem_zev_trajectory['success']):
-        print("Valid ZEM/ZEV trajectory found with time of flight:", zem_zev_trajectory['tf_opt'])
-
-        stride = k # Sub-sample the ZEM/ZEV trajectory to match the number of optimization nodes (N+1)
-        x_guess = zem_zev_trajectory['x_opt'][::stride]
-        y_guess = zem_zev_trajectory['y_opt'][::stride]
-        z_guess = zem_zev_trajectory['z_opt'][::stride]
-        vx_guess = zem_zev_trajectory['vx_opt'][::stride]
-        vy_guess = zem_zev_trajectory['vy_opt'][::stride]
-        vz_guess = zem_zev_trajectory['vz_opt'][::stride]
-        m_guess = zem_zev_trajectory['m_opt'][::stride]
-        ux_guess = zem_zev_trajectory['ux_opt'][::stride]
-        uy_guess = zem_zev_trajectory['uy_opt'][::stride]
-        uz_guess = zem_zev_trajectory['uz_opt'][::stride]
-        gamma_guess = np.sqrt(ux_guess**2 + uy_guess**2 + uz_guess**2)
-        tf_guess = zem_zev_trajectory['tf_opt']
-
-        # Initial guess solution: Use ZEM/ZEV trajectory for states, controls and final time
-        opti.set_initial(x_scaled, (x_guess - offsets['x']) / scale_factors['x'])
-        opti.set_initial(y_scaled, (y_guess - offsets['y']) / scale_factors['y'])
-        opti.set_initial(z_scaled, (z_guess - offsets['z']) / scale_factors['z'])
-        opti.set_initial(vx_scaled, (vx_guess - offsets['vx']) / scale_factors['vx'])
-        opti.set_initial(vy_scaled, (vy_guess - offsets['vy']) / scale_factors['vy'])
-        opti.set_initial(vz_scaled, (vz_guess - offsets['vz']) / scale_factors['vz'])
-        opti.set_initial(m_scaled, (m_guess - offsets['m']) / scale_factors['m'])
-        opti.set_initial(ux_scaled, (ux_guess - offsets['ux']) / scale_factors['ux'])
-        opti.set_initial(uy_scaled, (uy_guess - offsets['uy']) / scale_factors['uy'])
-        opti.set_initial(uz_scaled, (uz_guess - offsets['uz']) / scale_factors['uz'])
-        opti.set_initial(gamma_scaled, (gamma_guess - offsets['gamma']) / scale_factors['gamma'])
-        opti.set_initial(tf_scaled, (tf_guess - offsets['t']) / scale_factors['t'])
-    else:
-        print("Valid ZEM/ZEV trajectory not found, using linear interpolation initial guess instead")
-        # Initial guess solution: Linear interpolation between boundary conditions for states, and min thrust for controls
-        for i in range(N+1):
-            # Linear interpolation initial guess for states
-            t_frac = i / N
-            opti.set_initial(x_scaled[i], (1-t_frac)*x0_scaled + t_frac*xf_scaled)
-            opti.set_initial(y_scaled[i], (1-t_frac)*y0_scaled + t_frac*yf_scaled)
-            opti.set_initial(z_scaled[i], (1-t_frac)*z0_scaled + t_frac*zf_scaled)
-            opti.set_initial(vx_scaled[i], (1-t_frac)*vx0_scaled + t_frac*vxf_scaled)
-            opti.set_initial(vy_scaled[i], (1-t_frac)*vy0_scaled + t_frac*vyf_scaled)
-            opti.set_initial(vz_scaled[i], (1-t_frac)*vz0_scaled + t_frac*vzf_scaled)
-            opti.set_initial(m_scaled[i], (1-t_frac)*m0_scaled + t_frac*mf_scaled)
-
-            # Min thrust initial guess for controls
-            opti.set_initial(ux_scaled[i], u_min_scaled)
-            opti.set_initial(uy_scaled[i], u_min_scaled)
-            opti.set_initial(uz_scaled[i], u_min_scaled)
-            opti.set_initial(gamma_scaled[i], u_min_scaled)
-
-        # Initial guess for time horizon
-        opti.set_initial(tf_scaled, (t_min_scaled + t_max_scaled) / 2.0)
-
-    # Initialize slack on surface constraint to zero
-    opti.set_initial(slack_surface, 0.0)
-
-    # Objective function: Maximize final mass (by minimizing fuel use) AND minimize slack
-    # NOTE: Using slack variables on position and velocity seemed to worsen convergence. Better to use tolerances on terminal constraints.
-    surface_slack_penalty = 1e6
-    opti.minimize(-m_scaled[-1] + surface_slack_penalty * ca.sumsqr(slack_surface))
-
-    # Set up solver
-    opti.solver('ipopt', {
-        'ipopt.print_level': 5,
-        'expand': True,
-        'ipopt.max_iter': 500,
-        'ipopt.tol': 1e-6,
-        'ipopt.linear_solver': 'mumps',
-        'ipopt.hessian_approximation': 'exact',
-        'ipopt.nlp_scaling_method': 'gradient-based',
-        # 'ipopt.nlp_scaling_method': 'none',
-        # 'ipopt.mu_strategy': 'adaptive',
-    })
-
-    try:
-        # Solve the optimization problem
-        t_start = time()
-        sol = opti.solve()
-        t_end = time()
-        t_solve = t_end - t_start
-
-        solution_stats = opti.stats()
-        iterations = len(solution_stats['iterations']['inf_pr'])
-
-        # inf_pr_history = solution_stats['iterations']['inf_pr']
-        # inf_du_history = solution_stats['iterations']['inf_du']
-        # mu_history = solution_stats['iterations']['mu']
-        # d_norm_history = solution_stats['iterations']['d_norm']
-        # alpha_pr_history = solution_stats['iterations']['alpha_pr']
-        # alpha_du_history = solution_stats['iterations']['alpha_du']
-
-        # # print("inf_pr_history:")
-        # # print(inf_pr_history)
-
-        # # print("inf_du_history:")
-        # # print(inf_du_history)
-
-        # # 4-row subplot figure
-        # fig, axs = plt.subplots(4, 1, figsize=(9, 12), sharex=False)
-
-        # axs[0].semilogy(inf_pr_history, label='inf_pr')
-        # axs[0].semilogy(inf_du_history, label='inf_du')
-        # axs[0].set_title('IPOPT infeasibilities')
-        # axs[0].grid(True)
-        # axs[0].legend()
-
-        # axs[1].semilogy(mu_history, label='mu')
-        # axs[1].set_title('Barrier parameter (mu)')
-        # axs[1].grid(True)
-        # axs[1].legend()
-
-        # axs[2].plot(alpha_pr_history, label='alpha_pr')
-        # axs[2].plot(alpha_du_history, label='alpha_du')
-        # axs[2].set_title('Step sizes')
-        # axs[2].grid(True)
-        # axs[2].legend()
-
-        # axs[3].semilogy(d_norm_history, label='d_norm')
-        # axs[3].set_title('Search direction norm')
-        # axs[3].set_xlabel('Iteration')
-        # axs[3].grid(True)
-        # axs[3].legend()
-
-        # plt.tight_layout()
-        # plt.show()
-
-        print("Min scaled state magnitudes:", np.min(sol.value(X_scaled), axis=1))
-        print("Max scaled state magnitudes:", np.max(sol.value(X_scaled), axis=1))
-        print("Min scaled control magnitudes:", np.min(sol.value(U_scaled), axis=1))
-        print("Max scaled control magnitudes:", np.max(sol.value(U_scaled), axis=1))
-        print("Final scaled time:", sol.value(tf_scaled))
-
-        # Extract and unscale solution
-        tf_opt = sol.value(tf_scaled) * scale_factors['t'] + offsets['t']
-        x_opt = sol.value(x_scaled) * scale_factors['x'] + offsets['x']
-        y_opt = sol.value(y_scaled) * scale_factors['y'] + offsets['y']
-        z_opt = sol.value(z_scaled) * scale_factors['z'] + offsets['z']
-        vx_opt = sol.value(vx_scaled) * scale_factors['vx'] + offsets['vx']
-        vy_opt = sol.value(vy_scaled) * scale_factors['vy'] + offsets['vy']
-        vz_opt = sol.value(vz_scaled) * scale_factors['vz'] + offsets['vz']
-        m_opt = sol.value(m_scaled) * scale_factors['m'] + offsets['m']
-        ux_opt = sol.value(ux_scaled) * scale_factors['ux'] + offsets['ux']
-        uy_opt = sol.value(uy_scaled) * scale_factors['uy'] + offsets['uy']
-        uz_opt = sol.value(uz_scaled) * scale_factors['uz'] + offsets['uz']
-        gamma_opt = sol.value(gamma_scaled) * scale_factors['gamma'] + offsets['gamma']
-
-        print(f"--- Run succeeded ---")
-        print(f"Converged in {iterations} iterations ({t_solve:.2f} seconds)")
-        print(f"Final time: {tf_opt:.2f} s")
-        print(f"Final mass: {m_opt[-1]:.2f} kg")
         return {
-            "success": True,
-            "iterations": iterations,
-            "solve_time": t_solve,
-            "tf_opt": sol.value(tf_opt),
-            "x_opt": sol.value(x_opt),
-            "y_opt": sol.value(y_opt),
-            "z_opt": sol.value(z_opt),
-            "vx_opt": sol.value(vx_opt),
-            "vy_opt": sol.value(vy_opt),
-            "vz_opt": sol.value(vz_opt),
-            "m_opt": sol.value(m_opt),
-            "ux_opt": sol.value(ux_opt),
-            "uy_opt": sol.value(uy_opt),
-            "uz_opt": sol.value(uz_opt),
-            "gamma_opt": sol.value(gamma_opt)
+            'X': self.opti.variable(num_states, self.N+1),
+            'U': self.opti.variable(num_controls, self.N+1),
+            'tf': self.opti.variable(),
+            'slack_surface': self.opti.variable(1, self.N+1)
         }
-    except Exception as e:
-        print(f"--- Run failed: {e} ---")
-        return {"success": False}
+
+    def _scale_state(self, state: dict, scale_factors: dict, offsets: dict):
+        return {
+            'x': (state['x'] - offsets['x']) / scale_factors['x'],
+            'y': (state['y'] - offsets['y']) / scale_factors['y'],
+            'z': (state['z'] - offsets['z']) / scale_factors['z'],
+            'vx': (state['vx'] - offsets['vx']) / scale_factors['vx'],
+            'vy': (state['vy'] - offsets['vy']) / scale_factors['vy'],
+            'vz': (state['vz'] - offsets['vz']) / scale_factors['vz'],
+            'm': (state['m'] - offsets['m']) / scale_factors['m']
+        }
+
+    def _unscale_state(self, state_scaled: np.ndarray, scale_factors: dict, offsets: dict):
+        x = state_scaled[State.X] * scale_factors['x'] + offsets['x']
+        y = state_scaled[State.Y] * scale_factors['y'] + offsets['y']
+        z = state_scaled[State.Z] * scale_factors['z'] + offsets['z']
+        vx = state_scaled[State.VX] * scale_factors['vx'] + offsets['vx']
+        vy = state_scaled[State.VY] * scale_factors['vy'] + offsets['vy']
+        vz = state_scaled[State.VZ] * scale_factors['vz'] + offsets['vz']
+        m = state_scaled[State.M] * scale_factors['m'] + offsets['m']
+
+        return np.array([x, y, z, vx, vy, vz, m])
+
+    def _scale_control(self, control: dict, scale_factors: dict, offsets: dict):
+        return {
+            'ux': (control['ux'] - offsets['ux']) / scale_factors['ux'],
+            'uy': (control['uy'] - offsets['uy']) / scale_factors['uy'],
+            'uz': (control['uz'] - offsets['uz']) / scale_factors['uz'],
+            'gamma': (control['gamma'] - offsets['gamma']) / scale_factors['gamma']
+        }
+
+    def _unscale_control(self, control_scaled: np.ndarray, scale_factors: dict, offsets: dict):
+        ux = control_scaled[Control.X] * scale_factors['ux'] + offsets['ux']
+        uy = control_scaled[Control.Y] * scale_factors['uy'] + offsets['uy']
+        uz = control_scaled[Control.Z] * scale_factors['uz'] + offsets['uz']
+        gamma = control_scaled[Control.GAMMA] * scale_factors['gamma'] + offsets['gamma']
+
+        return np.array([ux, uy, uz, gamma])
+
+    def _scale_time(self, time: float, scale_factors: dict, offsets: dict):
+        return (time - offsets['t']) / scale_factors['t']
+
+    def _unscale_time(self, time_scaled: float, scale_factors: dict, offsets: dict):
+        return time_scaled * scale_factors['t'] + offsets['t']
+
+    def _scale_landing_tolerances(self, landing_tolerances: dict, scale_factors: dict):
+        return {
+            'x': (landing_tolerances['x']) / scale_factors['x'],
+            'y': (landing_tolerances['y']) / scale_factors['y'],
+            'z': (landing_tolerances['z']) / scale_factors['z'],
+            'vx': (landing_tolerances['vx']) / scale_factors['vx'],
+            'vy': (landing_tolerances['vy']) / scale_factors['vy'],
+            'vz': (landing_tolerances['vz']) / scale_factors['vz']
+        }
+
+    def _scale_bounds(self, bounds: dict, scale_factors: dict, offsets: dict):
+        return {
+            'u_min': (bounds['u_min'] - offsets['gamma']) / scale_factors['gamma'],
+            'u_max': (bounds['u_max'] - offsets['gamma']) / scale_factors['gamma'],
+            't_min': (bounds['t_min'] - offsets['t']) / scale_factors['t'],
+            't_max': (bounds['t_max'] - offsets['t']) / scale_factors['t']
+        }
+
+    def _add_boundary_constraints(self):
+        # State constraints at initial and final time steps
+        X_scaled = self.opt_vars_scaled['X']
+
+        # Initial state constraints
+        X0_scaled = self.initial_conditions_scaled
+        self.opti.subject_to(X_scaled[State.X, 0] == X0_scaled['x'])
+        self.opti.subject_to(X_scaled[State.Y, 0] == X0_scaled['y'])
+        self.opti.subject_to(X_scaled[State.Z, 0] == X0_scaled['z'])
+        self.opti.subject_to(X_scaled[State.VX, 0] == X0_scaled['vx'])
+        self.opti.subject_to(X_scaled[State.VY, 0] == X0_scaled['vy'])
+        self.opti.subject_to(X_scaled[State.VZ, 0] == X0_scaled['vz'])
+        self.opti.subject_to(X_scaled[State.M, 0] == X0_scaled['m'])
+
+        # Final state constraints
+        Xf_scaled = self.terminal_conditions_scaled
+        self.opti.subject_to(self.opti.bounded(Xf_scaled['x'] - self.landing_tolerances_scaled['x'], X_scaled[State.X, -1], Xf_scaled['x'] + self.landing_tolerances_scaled['x']))
+        self.opti.subject_to(self.opti.bounded(Xf_scaled['y'] - self.landing_tolerances_scaled['y'], X_scaled[State.Y, -1], Xf_scaled['y'] + self.landing_tolerances_scaled['y']))
+        self.opti.subject_to(self.opti.bounded(Xf_scaled['z'] - self.landing_tolerances_scaled['z'], X_scaled[State.Z, -1], Xf_scaled['z'] + self.landing_tolerances_scaled['z']))
+        self.opti.subject_to(self.opti.bounded(Xf_scaled['vx'] - self.landing_tolerances_scaled['vx'], X_scaled[State.VX, -1], Xf_scaled['vx'] + self.landing_tolerances_scaled['vx']))
+        self.opti.subject_to(self.opti.bounded(Xf_scaled['vy'] - self.landing_tolerances_scaled['vy'], X_scaled[State.VY, -1], Xf_scaled['vy'] + self.landing_tolerances_scaled['vy']))
+        self.opti.subject_to(self.opti.bounded(Xf_scaled['vz'] - self.landing_tolerances_scaled['vz'], X_scaled[State.VZ, -1], Xf_scaled['vz'] + self.landing_tolerances_scaled['vz']))
+
+        # Time constraint
+        tf_scaled = self.opt_vars_scaled['tf']
+        self.opti.subject_to(self.opti.bounded(self.bounds_scaled['t_min'], tf_scaled, self.bounds_scaled['t_max']))
+
+    def _add_path_constraints(self):
+        # Keep vehicle above surface (r >= R)
+        X_scaled = self.opt_vars_scaled['X']
+        # Using physical units since x, y and z scales might differ
+        X = self._unscale_state(X_scaled, self.scale_factors, self.offsets)
+        slack_surface = self.opt_vars_scaled['slack_surface']
+        self.opti.subject_to(slack_surface >= 0.0)
+        # IMPORTANT: Normalizing by R to keep gradients well-scaled (r >= R => r/R >= 1), and using slack variable to improve convergence
+        self.opti.subject_to(ca.sqrt(X[State.X]**2 + X[State.Y]**2 + X[State.Z]**2) / self.planet_params['R'] >= 1.0 - slack_surface)
+
+        # Control constraints
+        U_scaled = self.opt_vars_scaled['U']
+        self.opti.subject_to(self.opti.bounded(-self.bounds_scaled['u_max'], U_scaled[Control.X, :], self.bounds_scaled['u_max']))
+        self.opti.subject_to(self.opti.bounded(-self.bounds_scaled['u_max'], U_scaled[Control.Y, :], self.bounds_scaled['u_max']))
+        self.opti.subject_to(self.opti.bounded(-self.bounds_scaled['u_max'], U_scaled[Control.Z, :], self.bounds_scaled['u_max']))
+        self.opti.subject_to(self.opti.bounded(self.bounds_scaled['u_min'], U_scaled[Control.GAMMA, :], self.bounds_scaled['u_max']))
+        # Convex relaxation of thrust magnitude
+        self.opti.subject_to(U_scaled[Control.X, :]**2 + U_scaled[Control.Y, :]**2 + U_scaled[Control.Z, :]**2 <= U_scaled[Control.GAMMA, :]**2)
+
+        # Mass constraints
+        m_scaled = X_scaled[State.M, :]
+        mf_scaled = self.terminal_conditions_scaled['m']
+        # Keep mass above dry-mass lower bound everywhere
+        self.opti.subject_to(m_scaled >= mf_scaled)
+
+        # NOTE: This constraint really seems to help produce faster convergence and avoid infeasible solutions, why?
+        # Mass cannot increase over time
+        for k in range(self.N):
+            self.opti.subject_to(m_scaled[k+1] <= m_scaled[k])
+
+    def _add_hermite_simpson_dynamic_constraints(self):
+        """
+        Add dynamic constraints using Hermite-Simpson collocation.
+        """
+
+        # Time step
+        # NOTE: Is there a better way we can incorporate a free final time? "tdot = 1" or "time scaling"?
+        tf_scaled = self.opt_vars_scaled['tf']
+        dt_scaled = tf_scaled / self.N
+
+        for k in range(self.N):
+            xk = self.opt_vars_scaled['X'][:, k]
+            uk = self.opt_vars_scaled['U'][:, k]
+            xk_next = self.opt_vars_scaled['X'][:, k+1]
+            uk_next = self.opt_vars_scaled['U'][:, k+1]
+
+            # Dynamics at beginning and end of interval
+            fk = dynamics_scaled(xk, uk, self.planet_params, self.rocket_params, self.bounds, self.scale_factors, self.offsets)
+            fk_next = dynamics_scaled(xk_next, uk_next, self.planet_params, self.rocket_params, self.bounds, self.scale_factors, self.offsets)
+
+            # Midpoint state (Hermite interpolation)
+            xk_mid = 0.5 * (xk + xk_next) + (dt_scaled/8.0) * (fk - fk_next)
+
+            # Midpoint control (linear interpolation)
+            uk_mid = 0.5 * (uk + uk_next)
+
+            # Dynamics at midpoint
+            fk_mid = dynamics_scaled(xk_mid, uk_mid, self.planet_params, self.rocket_params, self.bounds, self.scale_factors, self.offsets)
+
+            # Simpson integration
+            self.opti.subject_to(xk_next == xk + (dt_scaled/6.0) * (fk + 4.0*fk_mid + fk_next))
+
+    def _compute_initial_solution_guess(self):
+        X_scaled = self.opt_vars_scaled['X']
+        U_scaled = self.opt_vars_scaled['U']
+        tf_scaled = self.opt_vars_scaled['tf']
+        slack_surface = self.opt_vars_scaled['slack_surface']
+
+        # Using ZEM/ZEV guidance law to generate an initial guess trajectory for the constrained trajectory optimization
+        zem_zev_pdg = ZEMZEVPoweredDescentGuidance(self.planet_params, self.rocket_params, dynamics_np)
+        k = 1 # Factor to increase number of integration steps for final trajectory once optimal time of flight is found in line search
+        N_final = k*self.N # Number of integration steps for final trajectory validation and plotting
+        N_pred = 10 # Number of integration steps for ZEM/ZEV prediction
+        t_min = self.bounds['t_min'] # Minimum time of flight in line search (s)
+        t_max = self.bounds['t_max'] # Maximum time of flight in line search (s)
+        t_tol = 1.0 # Optimal time of flight tolerance in line search (s)
+        r_tol = 100.0 # Only require roughly correct terminal position for initial guess, since optimization will refine it
+        v_tol = 100.0 # Only require roughly correct terminal velocity for initial guess, since optimization will refine it
+        zem_zev_trajectory = zem_zev_pdg.find_best_trajectory(self.initial_conditions, self.terminal_conditions, t_min, t_max, t_tol, r_tol, v_tol, self.N, N_final, N_pred)
+
+        if (zem_zev_trajectory['success']):
+            print("Valid ZEM/ZEV trajectory found with time of flight:", zem_zev_trajectory['tf_opt'])
+
+            stride = k # Sub-sample the ZEM/ZEV trajectory to match the number of optimization nodes (N+1)
+
+            X_guess = dict()
+            X_guess['x'] = zem_zev_trajectory['x_opt'][::stride]
+            X_guess['y'] = zem_zev_trajectory['y_opt'][::stride]
+            X_guess['z'] = zem_zev_trajectory['z_opt'][::stride]
+            X_guess['vx'] = zem_zev_trajectory['vx_opt'][::stride]
+            X_guess['vy'] = zem_zev_trajectory['vy_opt'][::stride]
+            X_guess['vz'] = zem_zev_trajectory['vz_opt'][::stride]
+            X_guess['m'] = zem_zev_trajectory['m_opt'][::stride]
+
+            U_guess = dict()
+            U_guess['ux'] = zem_zev_trajectory['ux_opt'][::stride]
+            U_guess['uy'] = zem_zev_trajectory['uy_opt'][::stride]
+            U_guess['uz'] = zem_zev_trajectory['uz_opt'][::stride]
+            U_guess['gamma'] = np.sqrt(U_guess['ux']**2 + U_guess['uy']**2 + U_guess['uz']**2)
+
+            tf_guess = zem_zev_trajectory['tf_opt']
+
+            tf_guess_scaled = self._scale_time(tf_guess, self.scale_factors, self.offsets)
+            X_guess_scaled = self._scale_state(X_guess, self.scale_factors, self.offsets)
+            U_guess_scaled = self._scale_control(U_guess, self.scale_factors, self.offsets)
+
+            # Initial guess solution: Use ZEM/ZEV trajectory for states, controls and final time
+            self.opti.set_initial(tf_scaled, tf_guess_scaled)
+
+            self.opti.set_initial(X_scaled[State.X, :], X_guess_scaled['x'])
+            self.opti.set_initial(X_scaled[State.Y, :], X_guess_scaled['y'])
+            self.opti.set_initial(X_scaled[State.Z, :], X_guess_scaled['z'])
+            self.opti.set_initial(X_scaled[State.VX, :], X_guess_scaled['vx'])
+            self.opti.set_initial(X_scaled[State.VY, :], X_guess_scaled['vy'])
+            self.opti.set_initial(X_scaled[State.VZ, :], X_guess_scaled['vz'])
+            self.opti.set_initial(X_scaled[State.M, :], X_guess_scaled['m'])
+
+            self.opti.set_initial(U_scaled[Control.X, :], U_guess_scaled['ux'])
+            self.opti.set_initial(U_scaled[Control.Y, :], U_guess_scaled['uy'])
+            self.opti.set_initial(U_scaled[Control.Z, :], U_guess_scaled['uz'])
+            self.opti.set_initial(U_scaled[Control.GAMMA, :], U_guess_scaled['gamma'])
+
+        else:
+            print("Valid ZEM/ZEV trajectory not found, using linear interpolation initial guess instead")
+            # Initial guess solution: Linear interpolation between boundary conditions for states, and min thrust for controls
+            X0_scaled = self.initial_conditions_scaled
+            Xf_scaled = self.terminal_conditions_scaled
+
+            for i in range(self.N+1):
+                # Linear interpolation initial guess for states
+                t_frac = i / self.N
+                self.opti.set_initial(X_scaled[State.X, i], (1.0 - t_frac)*X0_scaled['x'] + t_frac*Xf_scaled['x'])
+                self.opti.set_initial(X_scaled[State.Y, i], (1.0 - t_frac)*X0_scaled['y'] + t_frac*Xf_scaled['y'])
+                self.opti.set_initial(X_scaled[State.Z, i], (1.0 - t_frac)*X0_scaled['z'] + t_frac*Xf_scaled['z'])
+                self.opti.set_initial(X_scaled[State.VX, i], (1.0 - t_frac)*X0_scaled['vx'] + t_frac*Xf_scaled['vx'])
+                self.opti.set_initial(X_scaled[State.VY, i], (1.0 - t_frac)*X0_scaled['vy'] + t_frac*Xf_scaled['vy'])
+                self.opti.set_initial(X_scaled[State.VZ, i], (1.0 - t_frac)*X0_scaled['vz'] + t_frac*Xf_scaled['vz'])
+                self.opti.set_initial(X_scaled[State.M, i], (1.0 - t_frac)*X0_scaled['m'] + t_frac*Xf_scaled['m'])
+
+                # Min thrust initial guess for controls
+                self.opti.set_initial(U_scaled[Control.X, i], self.bounds_scaled['u_min'])
+                self.opti.set_initial(U_scaled[Control.Y, i], self.bounds_scaled['u_min'])
+                self.opti.set_initial(U_scaled[Control.Z, i], self.bounds_scaled['u_min'])
+                self.opti.set_initial(U_scaled[Control.GAMMA,  i], self.bounds_scaled['u_min'])
+
+            # Initial guess for time horizon
+            self.opti.set_initial(tf_scaled, (self.bounds_scaled['t_min'] + self.bounds_scaled['t_max']) / 2.0)
+
+        # Initialize slack on surface constraint to zero
+        self.opti.set_initial(slack_surface, 0.0)
+
+    def _add_objective_function(self):
+        m_scaled = self.opt_vars_scaled['X'][State.M, :]
+        slack_surface = self.opt_vars_scaled['slack_surface']
+
+        # Objective function: Maximize final mass (by minimizing fuel use) AND minimize slack
+        # NOTE: Using slack variables on position and velocity seemed to worsen convergence. Better to use tolerances on terminal constraints.
+        surface_slack_penalty = 1.0e6
+        self.opti.minimize(-m_scaled[-1] + surface_slack_penalty * ca.sumsqr(slack_surface))
+
+    def _solve(self):
+        # Set up solver
+        ipopt_options = {
+            'ipopt.print_level': 5,
+            'expand': True,
+            'ipopt.max_iter': 500,
+            'ipopt.tol': 1e-6,
+            'ipopt.linear_solver': 'mumps',
+            'ipopt.hessian_approximation': 'exact',
+            'ipopt.nlp_scaling_method': 'gradient-based',
+            # 'ipopt.nlp_scaling_method': 'none',
+            # 'ipopt.mu_strategy': 'adaptive',
+        }
+        self.opti.solver('ipopt', ipopt_options)
+
+        try:
+            # Solve the optimization problem
+            t_start = time()
+            sol = self.opti.solve()
+            t_end = time()
+            t_solve = t_end - t_start
+
+            solution_stats = self.opti.stats()
+            iterations = len(solution_stats['iterations']['inf_pr'])
+
+            # inf_pr_history = solution_stats['iterations']['inf_pr']
+            # inf_du_history = solution_stats['iterations']['inf_du']
+            # mu_history = solution_stats['iterations']['mu']
+            # d_norm_history = solution_stats['iterations']['d_norm']
+            # alpha_pr_history = solution_stats['iterations']['alpha_pr']
+            # alpha_du_history = solution_stats['iterations']['alpha_du']
+
+            # # print("inf_pr_history:")
+            # # print(inf_pr_history)
+
+            # # print("inf_du_history:")
+            # # print(inf_du_history)
+
+            # # 4-row subplot figure
+            # fig, axs = plt.subplots(4, 1, figsize=(9, 12), sharex=False)
+
+            # axs[0].semilogy(inf_pr_history, label='inf_pr')
+            # axs[0].semilogy(inf_du_history, label='inf_du')
+            # axs[0].set_title('IPOPT infeasibilities')
+            # axs[0].grid(True)
+            # axs[0].legend()
+
+            # axs[1].semilogy(mu_history, label='mu')
+            # axs[1].set_title('Barrier parameter (mu)')
+            # axs[1].grid(True)
+            # axs[1].legend()
+
+            # axs[2].plot(alpha_pr_history, label='alpha_pr')
+            # axs[2].plot(alpha_du_history, label='alpha_du')
+            # axs[2].set_title('Step sizes')
+            # axs[2].grid(True)
+            # axs[2].legend()
+
+            # axs[3].semilogy(d_norm_history, label='d_norm')
+            # axs[3].set_title('Search direction norm')
+            # axs[3].set_xlabel('Iteration')
+            # axs[3].grid(True)
+            # axs[3].legend()
+
+            # plt.tight_layout()
+            # plt.show()
+
+            # Extract and unscale solution
+            X_scaled = self.opt_vars_scaled['X']
+            U_scaled = self.opt_vars_scaled['U']
+            tf_scaled = self.opt_vars_scaled['tf']
+
+            print("Min scaled state magnitudes:", np.min(sol.value(X_scaled), axis=1))
+            print("Max scaled state magnitudes:", np.max(sol.value(X_scaled), axis=1))
+            print("Min scaled control magnitudes:", np.min(sol.value(U_scaled), axis=1))
+            print("Max scaled control magnitudes:", np.max(sol.value(U_scaled), axis=1))
+            print("Final scaled time:", sol.value(tf_scaled))
+
+            X = self._unscale_state(sol.value(X_scaled), self.scale_factors, self.offsets)
+            U = self._unscale_control(sol.value(U_scaled), self.scale_factors, self.offsets)
+            tf = self._unscale_time(sol.value(tf_scaled), self.scale_factors, self.offsets)
+
+            print(f"--- Run succeeded ---")
+            print(f"Converged in {iterations} iterations ({t_solve:.2f} seconds)")
+            print(f"Final time: {tf:.2f} s")
+            print(f"Final mass: {X[State.M, -1]:.2f} kg")
+            return {
+                "success": True,
+                "iterations": iterations,
+                "solve_time": t_solve,
+                "tf_opt": tf,
+                "x_opt": X[State.X, :],
+                "y_opt": X[State.Y, :],
+                "z_opt": X[State.Z, :],
+                "vx_opt": X[State.VX, :],
+                "vy_opt": X[State.VY, :],
+                "vz_opt": X[State.VZ, :],
+                "m_opt": X[State.M, :],
+                "ux_opt": U[Control.X, :],
+                "uy_opt": U[Control.Y, :],
+                "uz_opt": U[Control.Z, :],
+                "gamma_opt": U[Control.GAMMA, :]
+            }
+        except Exception as e:
+            print(f"--- Run failed: {e} ---")
+            return {"success": False}
 
 def main():
     # Planet parameters
@@ -502,13 +607,13 @@ def main():
 
     # Fixed terminal conditions for all runs
     terminal_conditions = {
-        'xf': 0.0, # Final x-position (m)
-        'yf': 0.0, # Final y-position (m)
-        'zf': planet_params['R'], # Final z-position (m)
-        'vxf': 0.0, # Final x-velocity (m/s)
-        'vyf': 0.0, # Final y-velocity (m/s)
-        'vzf': 0.0, # Final z-velocity (m/s)
-        'mf': rocket_params['mass_dry'] # Minimum ALLOWABLE final mass (kg)
+        'x': 0.0, # Final x-position (m)
+        'y': 0.0, # Final y-position (m)
+        'z': planet_params['R'], # Final z-position (m)
+        'vx': 0.0, # Final x-velocity (m/s)
+        'vy': 0.0, # Final y-velocity (m/s)
+        'vz': 0.0, # Final z-velocity (m/s)
+        'm': rocket_params['mass_dry'] # Minimum ALLOWABLE final mass (kg)
     }
 
     # Control and time bounds
@@ -521,12 +626,12 @@ def main():
 
     # Position and velocity tolerances for terminal constraints
     landing_tolerances = {
-        'x_tol': 1.0,    # Position tolerance (m)
-        'y_tol': 1.0,    # Position tolerance (m)
-        'z_tol': 1.0,    # Position tolerance (m)
-        'vx_tol': 0.5,    # Velocity tolerance (m/s)
-        'vy_tol': 0.5,    # Velocity tolerance (m/s)
-        'vz_tol': 0.5,    # Velocity tolerance (m/s)
+        'x': 1.0,    # Position tolerance (m)
+        'y': 1.0,    # Position tolerance (m)
+        'z': 1.0,    # Position tolerance (m)
+        'vx': 0.5,    # Velocity tolerance (m/s)
+        'vy': 0.5,    # Velocity tolerance (m/s)
+        'vz': 0.5,    # Velocity tolerance (m/s)
     }
 
     N = 50 # Number of control intervals
@@ -540,24 +645,14 @@ def main():
         print(f"--- Starting run {i+1}/{num_runs} ---")
         # Randomized initial conditions
         initial_conditions = {
-            'x0': np.random.uniform(-50000.0, 50000.0), # m
-            'y0': np.random.uniform(-50000.0, 50000.0), # m
-            'z0': planet_params['R'] + np.random.uniform(50000.0, 150000.0), # m
-            'vx0': np.random.uniform(-1000.0, 1000.0), # m/s
-            'vy0': np.random.uniform(-1000.0, 1000.0), # m/s
-            'vz0': np.random.uniform(-500.0, 500.0), # m/s
-            'm0': rocket_params['mass_start'] # kg - Landing mass (Dry mass + reserve)
+            'x': np.random.uniform(-50000.0, 50000.0), # m
+            'y': np.random.uniform(-50000.0, 50000.0), # m
+            'z': planet_params['R'] + np.random.uniform(50000.0, 150000.0), # m
+            'vx': np.random.uniform(-1000.0, 1000.0), # m/s
+            'vy': np.random.uniform(-1000.0, 1000.0), # m/s
+            'vz': np.random.uniform(-500.0, 500.0), # m/s
+            'm': rocket_params['mass_start'] # kg - Landing mass (Dry mass + reserve)
         }
-
-        # --- Failed Initial Conditions ---
-        # initial_conditions = {'x0': 10333.00064753613, 'y0': -14102.69257401282, 'z0': 6451802.3336159075, 'vx0': 646.6701807114714, 'vy0': 121.62380764174964, 'vz0': -152.95896172646286, 'm0': 75000.0}
-        # initial_conditions = {'x0': -10988.148096549397, 'y0': 39553.273620720895, 'z0': 6430847.15719154, 'vx0': 821.1205393090227, 'vy0': 457.70904823551905, 'vz0': -372.8149990047769, 'm0': 75000.0}
-        # initial_conditions = {'x0': -2229.5538019762243, 'y0': 25230.130182274952, 'z0': 6450341.862722686, 'vx0': 15.920842801517665, 'vy0': 454.84039373955056, 'vz0': -156.4300590392359, 'm0': 75000.0}
-        # initial_conditions = {'x0': -20476.74314880714, 'y0': -13615.78880679213, 'z0': 6444010.141756712, 'vx0': 392.54362697458873, 'vy0': 284.2714639006099, 'vz0': -267.7434706956784, 'm0': 75000.0}
-        # initial_conditions = {'x0': 28840.55161689737, 'y0': -20875.4851646929, 'z0': 6434001.974537622, 'vx0': 559.796802578966, 'vy0': 368.6994615807289, 'vz0': -204.34760760308177, 'm0': 75000.0}
-        # initial_conditions = {'x0': -31518.45806321033, 'y0': 47770.549924390696, 'z0': 6433824.722904884, 'vx0': 209.2517851410796, 'vy0': 515.7533383325085, 'vz0': -79.33290732940077, 'm0': 75000.0}
-        # initial_conditions = {'x0': 31116.18834065397, 'y0': 28482.906354009217, 'z0': 6449458.003926393, 'vx0': 634.4300909114133, 'vy0': 76.80522338545347, 'vz0': -192.1010130966052, 'm0': 75000.0}
-        # initial_conditions = {'x0': -1481.8618443154555, 'y0': 28626.116533809356, 'z0': 6437017.691213863, 'vx0': 103.67629902591716, 'vy0': 725.7214163473893, 'vz0': -67.99194802672406, 'm0': 75000.0}
 
         # Scaling factors for non-dimensionalization
         scale_factors = {
@@ -593,7 +688,8 @@ def main():
 
         print(f"Initial conditions (run {i+1}): {initial_conditions}")
 
-        result = run_optimization(initial_conditions, terminal_conditions, planet_params, rocket_params, bounds, landing_tolerances, scale_factors, offsets, N)
+        hermite_simpson_pdg = HermiteSimpsonPoweredDescentGuidance(planet_params, rocket_params, dynamics_scaled)
+        result = hermite_simpson_pdg.generate_trajectory(initial_conditions, terminal_conditions, bounds, landing_tolerances, scale_factors, offsets, N)
         results.append(result)
         if not result['success']:
             failed_initial_conditions.append(initial_conditions)

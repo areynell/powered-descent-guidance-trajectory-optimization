@@ -3,7 +3,7 @@ import numpy as np
 
 def plot_single_run(trajectory, N, R):
     """
-    Plot the results of a single successful run.
+    Plot the results of a single trajectory.
     """
 
     tf = trajectory["tf_opt"]
@@ -96,7 +96,7 @@ def plot_single_run(trajectory, N, R):
 
 def plot_multiple_runs(trajectories):
     """
-    Plot the results and statistics of multiple successful runs.
+    Plot the results and statistics of multiple trajectories.
     """
 
     final_masses = [r["m_opt"][-1] for r in trajectories]
@@ -107,6 +107,7 @@ def plot_multiple_runs(trajectories):
     print(f"  Min: {int(np.min(iterations))}")
     print(f"  Max: {int(np.max(iterations))}")
     print(f"  Mean: {float(np.mean(iterations)):.2f}")
+    print(f"  Median: {float(np.median(iterations)):.2f}")
     print(f"  Standard Deviation: {float(np.std(iterations)):.2f}")
 
     print("\nFinal Mass (kg):")
