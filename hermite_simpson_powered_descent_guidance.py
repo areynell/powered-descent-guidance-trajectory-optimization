@@ -17,7 +17,7 @@ from time import time
 
 import trajectory_validation as traj_val
 import trajectory_plotting as traj_plot
-from zem_zev_guidance import ZEMZEVPoweredDescentGuidance
+from zem_zev_powered_descent_guidance import ZEMZEVPoweredDescentGuidance
 
 class State(IntEnum):
     X = 0
