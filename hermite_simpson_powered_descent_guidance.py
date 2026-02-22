@@ -573,27 +573,26 @@ def main():
 
     # Rocket parameters
     rocket_params = {
+        'mass_start': 75000.0, # Starting mass (kg) - Falcon 9 Mass at start of boostback burn
+        'mass_dry': 22200.0, # Dry mass (kg) - Falcon 9 Dry Mass
         'thrust_min': 0.4*845000.0, # Minimum thrust from 1 engine (N) - ~40% throttle
         'thrust_max': 3*845000.0, # Maximum thrust from 3 engines (N) - Merlin 1D SL
         'Isp': 282.0, # Specific impulse (s)
         # 'Isp': 500.0, # Specific impulse (s)
         'g0': 9.81, # Standard gravity (m/s^2)
-        'mass_start': 75000.0, # Starting mass (kg) - Falcon 9 Mass at start of boostback burn
-        'mass_dry': 22200.0, # Dry mass (kg) - Falcon 9 Dry Mass
         'Aref': np.pi*(3.7/2)**2, # Reference area (m^2)
         'Cd': 1.8 # Drag coefficient (assumed)
     }
 
     # Fixed terminal conditions for all runs
-    terminal_conditions_dict = {
-        'x': 0.0, # Final x-position (m)
-        'y': 0.0, # Final y-position (m)
-        'z': planet_params['R'], # Final z-position (m)
-        'vx': 0.0, # Final x-velocity (m/s)
-        'vy': 0.0, # Final y-velocity (m/s)
-        'vz': 0.0, # Final z-velocity (m/s)
-        'm': rocket_params['mass_dry'] # Minimum ALLOWABLE final mass (kg)
-    }
+    terminal_conditions = np.zeros(7)
+    terminal_conditions[State.X] = 0.0
+    terminal_conditions[State.Y] = 0.0
+    terminal_conditions[State.Z] = planet_params['R']
+    terminal_conditions[State.VX] = 0.0
+    terminal_conditions[State.VY] = 0.0
+    terminal_conditions[State.VZ] = 0.0
+    terminal_conditions[State.M] = rocket_params['mass_dry']
 
     # Control and time bounds
     bounds = {
@@ -619,15 +618,14 @@ def main():
     for i in range(num_runs):
         print(f"--- Starting run {i+1}/{num_runs} ---")
         # Randomized initial conditions
-        initial_conditions_dict = {
-            'x': np.random.uniform(-50000.0, 50000.0), # m
-            'y': np.random.uniform(-50000.0, 50000.0), # m
-            'z': planet_params['R'] + np.random.uniform(50000.0, 150000.0), # m
-            'vx': np.random.uniform(-1000.0, 1000.0), # m/s
-            'vy': np.random.uniform(-1000.0, 1000.0), # m/s
-            'vz': np.random.uniform(-500.0, 500.0), # m/s
-            'm': rocket_params['mass_start'] # kg - Landing mass (Dry mass + reserve)
-        }
+        initial_conditions = np.zeros(7)
+        initial_conditions[State.X] = np.random.uniform(-50000.0, 50000.0) # m
+        initial_conditions[State.Y] = np.random.uniform(-50000.0, 50000.0) # m
+        initial_conditions[State.Z] = planet_params['R'] + np.random.uniform(50000.0, 150000.0) # m
+        initial_conditions[State.VX] = np.random.uniform(-1000.0, 1000.0) # m/s
+        initial_conditions[State.VY] = np.random.uniform(-1000.0, 1000.0) # m/s
+        initial_conditions[State.VZ] = np.random.uniform(-500.0, 500.0) # m/s
+        initial_conditions[State.M] = rocket_params['mass_start'] # kg - Landing mass (Dry mass + reserve)
 
         # Scaling factors for non-dimensionalization
         scale_factors = {
@@ -661,11 +659,9 @@ def main():
             't': 0.0
         }
 
-        print(f"Initial conditions (run {i+1}): {initial_conditions_dict}")
+        print(f"Initial conditions (run {i+1}): {initial_conditions}")
 
         hermite_simpson_pdg = HermiteSimpsonPoweredDescentGuidance(planet_params, rocket_params, dynamics_scaled)
-        initial_conditions = np.array(list(initial_conditions_dict.values()))
-        terminal_conditions = np.array(list(terminal_conditions_dict.values()))
         result = hermite_simpson_pdg.generate_trajectory(initial_conditions, terminal_conditions, bounds, landing_tolerances, scale_factors, offsets, N)
         results.append(result)
         if not result['success']:

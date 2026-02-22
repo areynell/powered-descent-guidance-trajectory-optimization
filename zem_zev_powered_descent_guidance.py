@@ -384,15 +384,14 @@ def main():
         'Cd': 1.8 # Drag coefficient (assumed)
     }
 
-    terminal_conditions_dict = {
-        'x': 0.0, # Final x-position (m)
-        'y': 0.0, # Final y-position (m)
-        'z': planet_params['R'], # Final z-position (m) - on the surface
-        'vx': 0.0, # Final x-velocity (m/s)
-        'vy': 0.0, # Final y-velocity (m/s)
-        'vz': 0.0, # Final z-velocity (m/s)
-        'm': rocket_params['mass_dry'] # Minimum ALLOWABLE final mass (kg)
-    }
+    terminal_conditions = np.zeros(7)
+    terminal_conditions[State.X] = 0.0
+    terminal_conditions[State.Y] = 0.0
+    terminal_conditions[State.Z] = planet_params['R']
+    terminal_conditions[State.VX] = 0.0
+    terminal_conditions[State.VY] = 0.0
+    terminal_conditions[State.VZ] = 0.0
+    terminal_conditions[State.M] = rocket_params['mass_dry']
 
     num_runs = 100
     N = 50 # Number of integration steps in generated trajectories during line search
@@ -410,23 +409,20 @@ def main():
     np.random.seed(8)
     for i in range(num_runs):
         # Generate random initial conditions for each run
-        initial_conditions_dict = {
-            'x': np.random.uniform(-50000.0, 50000.0), # m
-            'y': np.random.uniform(-50000.0, 50000.0), # m
-            'z': planet_params['R'] + np.random.uniform(50000.0, 150000.0), # m
-            'vx': np.random.uniform(-1000.0, 1000.0), # m/s
-            'vy': np.random.uniform(-1000.0, 1000.0), # m/s
-            'vz': np.random.uniform(-500.0, 500.0), # m/s
-            'm': rocket_params['mass_start'] # kg
-        }
+        initial_conditions = np.zeros(7)
+        initial_conditions[State.X] = np.random.uniform(-50000.0, 50000.0) # m
+        initial_conditions[State.Y] = np.random.uniform(-50000.0, 50000.0) # m
+        initial_conditions[State.Z] = planet_params['R'] + np.random.uniform(50000.0, 150000.0) # m
+        initial_conditions[State.VX] = np.random.uniform(-1000.0, 1000.0) # m/s
+        initial_conditions[State.VY] = np.random.uniform(-1000.0, 1000.0) # m/s
+        initial_conditions[State.VZ] = np.random.uniform(-500.0, 500.0) # m/s
+        initial_conditions[State.M] = rocket_params['mass_start'] # kg
 
         # initial_conditions = {'x0': 48045.32429793403, 'y0': 38719.85545747625, 'z0': 6480179.72465158, 'vx0': 951.9382652644483, 'vy0': 968.2924888876025, 'vz0': -271.9402464272812, 'm0': 75000.0}
 
-        print(f"Initial conditions (run {i+1}): {initial_conditions_dict}")
+        print(f"Initial conditions (run {i+1}): {initial_conditions}")
 
         zem_zev_pdg = ZEMZEVPoweredDescentGuidance(planet_params, rocket_params, state_dynamics)
-        initial_conditions = np.array(list(initial_conditions_dict.values()))
-        terminal_conditions = np.array(list(terminal_conditions_dict.values()))
         result = zem_zev_pdg.find_best_trajectory(initial_conditions, terminal_conditions, t_min, t_max, t_tol, r_tol, v_tol, N, N_final, N_pred, verbose)
         results.append(result)
         if not result['success']:
