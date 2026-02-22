@@ -1,9 +1,13 @@
+from enum import IntEnum
+
 import numpy as np
 from scipy.optimize import minimize_scalar
 from time import time
 
 import trajectory_plotting as traj_plot
 import trajectory_validation as traj_val
+
+from common import State, Control
 
 class ZEMZEVPoweredDescentGuidance:
     def __init__(self, planet_params: dict, rocket_params: dict, state_dynamics_func: callable):
@@ -87,8 +91,8 @@ class ZEMZEVPoweredDescentGuidance:
         # Predict terminal state under zero thrust
         zero_controls = np.zeros((3, N_pred+1)) # Zero control inputs for propagation
         X_pred = self._propagate_states_rk4(state, zero_controls, t_go, N_pred)
-        r_pred = X_pred[0:3, -1]  # Predicted final position after propagating with zero control
-        v_pred = X_pred[3:6, -1]  # Predicted final velocity after propagating with zero control
+        r_pred = X_pred[State.X:State.Z+1, -1]  # Predicted final position after propagating with zero control
+        v_pred = X_pred[State.VX:State.VZ+1, -1]  # Predicted final velocity after propagating with zero control
 
         # Calculate Zero-Effort-Miss (ZEM) and Zero-Effort-Velocity (ZEV) based on the predicted final state
         zem = r_target - r_pred
@@ -138,13 +142,13 @@ class ZEMZEVPoweredDescentGuidance:
             return a_cmd
 
     # TODO: ADD JIT
-    def _generate_trajectory(self, initial_conditions: dict, terminal_conditions: dict, t_final: float, N: int, N_pred: int, verbose: bool = False) -> dict:
+    def _generate_trajectory(self, initial_conditions: np.ndarray, terminal_conditions: np.ndarray, t_final: float, N: int, N_pred: int, verbose: bool = False) -> dict:
         """
         Generates a trajectory using the ZEM/ZEV guidance law.
 
         Args:
-            initial_conditions (dict): Dictionary containing initial state parameters
-            terminal_conditions (dict): Dictionary containing terminal state parameters
+            initial_conditions (np.ndarray): Array containing initial state parameters
+            terminal_conditions (np.ndarray): Array containing terminal state parameters
             t_final (float): Time of flight for the trajectory (s)
             N (int): Number of integration steps for trajectory generation
             N_pred (int): Number of integration steps for ZEM/ZEV prediction
@@ -162,14 +166,14 @@ class ZEMZEVPoweredDescentGuidance:
         t_hist = []
 
         # Initial State
-        r = np.array([initial_conditions['x'], initial_conditions['y'], initial_conditions['z']])
-        v = np.array([initial_conditions['vx'], initial_conditions['vy'], initial_conditions['vz']])
-        m = initial_conditions['m']
+        r = np.array([initial_conditions[State.X], initial_conditions[State.Y], initial_conditions[State.Z]])
+        v = np.array([initial_conditions[State.VX], initial_conditions[State.VY], initial_conditions[State.VZ]])
+        m = initial_conditions[State.M]
         t = 0.0
 
         # Target State
-        r_target = np.array([terminal_conditions['x'], terminal_conditions['y'], terminal_conditions['z']])
-        v_target = np.array([terminal_conditions['vx'], terminal_conditions['vy'], terminal_conditions['vz']])
+        r_target = np.array([terminal_conditions[State.X], terminal_conditions[State.Y], terminal_conditions[State.Z]])
+        v_target = np.array([terminal_conditions[State.VX], terminal_conditions[State.VY], terminal_conditions[State.VZ]])
 
         # Compute/store node 0 (t=0)
         t_go = t_final - t
@@ -203,9 +207,9 @@ class ZEMZEVPoweredDescentGuidance:
 
             # State propagation
             X = self._rk4_step(state, u, dt)
-            r = X[0:3]
-            v = X[3:6]
-            m = X[6]
+            r = X[State.X:State.Z+1]
+            v = X[State.VX:State.VZ+1]
+            m = X[State.M]
             t = t + dt
 
             r_hist.append(r.copy())
@@ -214,35 +218,33 @@ class ZEMZEVPoweredDescentGuidance:
             u_hist.append(u.copy())
             t_hist.append(t)
 
-        r_hist = np.asarray(r_hist, dtype=float)
-        v_hist = np.asarray(v_hist, dtype=float)
+        r_hist = np.asarray(r_hist, dtype=float).T
+        v_hist = np.asarray(v_hist, dtype=float).T
         m_hist = np.asarray(m_hist, dtype=float)
-        u_hist = np.asarray(u_hist, dtype=float)
+        u_hist = np.asarray(u_hist, dtype=float).T
         t_hist = np.asarray(t_hist, dtype=float)
 
         # Final error check
-        pos_error = np.linalg.norm(r_hist[-1] - r_target)
-        vel_error = np.linalg.norm(v_hist[-1] - v_target)
+        pos_error = np.linalg.norm(r_hist[:, -1] - r_target)
+        vel_error = np.linalg.norm(v_hist[:, -1] - v_target)
 
         if verbose:
             print(f"Final position error: {pos_error:.2f} m")
             print(f"Final velocity error: {vel_error:.2f} m/s")
 
         return {
-            "r": r_hist,
-            "v": v_hist,
-            "m": m_hist,
-            "u": u_hist,
-            "t": t_hist
+            't': t_hist,
+            'X': np.vstack((r_hist, v_hist, m_hist)),
+            'U': u_hist,
         }
 
-    def find_best_trajectory(self, initial_conditions: dict, terminal_conditions: dict, t_min: float, t_max: float, t_tol: float, r_tol: float, v_tol: float, N: int, N_final: int, N_pred: int, verbose: bool = False) -> dict:
+    def find_best_trajectory(self, initial_conditions: np.ndarray, terminal_conditions: np.ndarray, t_min: float, t_max: float, t_tol: float, r_tol: float, v_tol: float, N: int, N_final: int, N_pred: int, verbose: bool = False) -> dict:
         """
         Performs a line search over the time of flight to find the trajectory that maximizes final mass (minimizes fuel consumption).
 
         Args:
-            initial_conditions (dict): Dictionary containing initial state parameters
-            terminal_conditions (dict): Dictionary containing terminal state parameters
+            initial_conditions (np.ndarray): Array containing initial state parameters
+            terminal_conditions (np.ndarray): Array containing terminal state parameters
             t_min (float): Minimum time of flight for line search
             t_max (float): Maximum time of flight for line search
             t_tol (float): Tolerance for time of flight optimization
@@ -259,7 +261,7 @@ class ZEMZEVPoweredDescentGuidance:
 
         def trajectory_cost(t_final: float) -> float:
             trajectory = self._generate_trajectory(initial_conditions, terminal_conditions, t_final, N, N_pred, verbose)
-            cost = -trajectory['m'][-1]
+            cost = -trajectory['X'][State.M, -1]  # Final mass is the last element in the state vector, negate for minimization
             return cost  # Minimize negative final mass (maximize final mass)
 
         disp = 3 if verbose else 0
@@ -277,41 +279,32 @@ class ZEMZEVPoweredDescentGuidance:
         # Run final trajectory generation using the time of flight that produced the lowest cost trajectory
         best_trajectory = self._generate_trajectory(initial_conditions, terminal_conditions, t_opt, N_final, N_pred, verbose)
 
-        best_rf = np.array([best_trajectory['r'][-1,0], best_trajectory['r'][-1,1], best_trajectory['r'][-1,2]])
-        best_vf = np.array([best_trajectory['v'][-1,0], best_trajectory['v'][-1,1], best_trajectory['v'][-1,2]])
-        target_rf = np.array([terminal_conditions['x'], terminal_conditions['y'], terminal_conditions['z']])
-        target_vf = np.array([terminal_conditions['vx'], terminal_conditions['vy'], terminal_conditions['vz']])
+        best_rf = np.array([best_trajectory['X'][State.X, -1], best_trajectory['X'][State.Y, -1], best_trajectory['X'][State.Z, -1]])
+        best_vf = np.array([best_trajectory['X'][State.VX, -1], best_trajectory['X'][State.VY, -1], best_trajectory['X'][State.VZ, -1]])
+        target_rf = np.array([terminal_conditions[State.X], terminal_conditions[State.Y], terminal_conditions[State.Z]])
+        target_vf = np.array([terminal_conditions[State.VX], terminal_conditions[State.VY], terminal_conditions[State.VZ]])
         pos_error = np.linalg.norm(best_rf - target_rf)
         vel_error = np.linalg.norm(best_vf - target_vf)
         if verbose:
             print(f"Best trajectory final position error: {pos_error:.2f} m")
             print(f"Best trajectory final velocity error: {vel_error:.2f} m/s")
-            print(f"Best trajectory final mass: {best_trajectory['m'][-1]:.2f} kg")
+            print(f"Best trajectory final mass: {best_trajectory['X'][State.M, -1]:.2f} kg")
 
         success = True
         if (pos_error > r_tol or vel_error > v_tol):
             success = False
             print("WARNING: Best trajectory failed to meet terminal conditions within acceptable error thresholds. Final position error: {:.2f} m, final velocity error: {:.2f} m/s".format(pos_error, vel_error))
-        # if best_trajectory['m'][-1] < terminal_conditions['mf']:
+        # if best_trajectory['X'][State.M, -1] < terminal_conditions[State.M]:
         #     best_trajectory['success'] = False
-        #     print("WARNING: Best trajectory failed to meet minimum final mass requirement. Final mass: {:.2f} kg, minimum required mass: {:.2f} kg".format(best_trajectory['m'][-1], terminal_conditions['mf']))
+        #     print("WARNING: Best trajectory failed to meet minimum final mass requirement. Final mass: {:.2f} kg, minimum required mass: {:.2f} kg".format(best_trajectory['X'][State.M, -1], terminal_conditions[State.M]))
 
         return {
-            "success": success,
-            "iterations": opt_result.nit,
-            "solve_time": t_solve,
-            "tf_opt": t_opt,
-            "x_opt": best_trajectory['r'][:,0],
-            "y_opt": best_trajectory['r'][:,1],
-            "z_opt": best_trajectory['r'][:,2],
-            "vx_opt": best_trajectory['v'][:,0],
-            "vy_opt": best_trajectory['v'][:,1],
-            "vz_opt": best_trajectory['v'][:,2],
-            "m_opt": best_trajectory['m'],
-            "ux_opt": best_trajectory['u'][:,0],
-            "uy_opt": best_trajectory['u'][:,1],
-            "uz_opt": best_trajectory['u'][:,2],
-            "gamma_opt": None
+            'success': success,
+            'iterations': opt_result.nit,
+            'solve_time': t_solve,
+            'tf': t_opt,
+            'X': best_trajectory['X'],
+            'U': best_trajectory['U'],
         }
 
 # TODO: ADD JIT
@@ -391,7 +384,7 @@ def main():
         'Cd': 1.8 # Drag coefficient (assumed)
     }
 
-    terminal_conditions = {
+    terminal_conditions_dict = {
         'x': 0.0, # Final x-position (m)
         'y': 0.0, # Final y-position (m)
         'z': planet_params['R'], # Final z-position (m) - on the surface
@@ -401,7 +394,7 @@ def main():
         'm': rocket_params['mass_dry'] # Minimum ALLOWABLE final mass (kg)
     }
 
-    num_runs = 1
+    num_runs = 100
     N = 50 # Number of integration steps in generated trajectories during line search
     N_final = 10*N # Number of integration steps in final optimized trajectory
     N_pred = 10 # Number of integration steps for ZEM/ZEV prediction
@@ -417,7 +410,7 @@ def main():
     np.random.seed(8)
     for i in range(num_runs):
         # Generate random initial conditions for each run
-        initial_conditions = {
+        initial_conditions_dict = {
             'x': np.random.uniform(-50000.0, 50000.0), # m
             'y': np.random.uniform(-50000.0, 50000.0), # m
             'z': planet_params['R'] + np.random.uniform(50000.0, 150000.0), # m
@@ -429,9 +422,11 @@ def main():
 
         # initial_conditions = {'x0': 48045.32429793403, 'y0': 38719.85545747625, 'z0': 6480179.72465158, 'vx0': 951.9382652644483, 'vy0': 968.2924888876025, 'vz0': -271.9402464272812, 'm0': 75000.0}
 
-        print(f"Initial conditions (run {i+1}): {initial_conditions}")
+        print(f"Initial conditions (run {i+1}): {initial_conditions_dict}")
 
         zem_zev_pdg = ZEMZEVPoweredDescentGuidance(planet_params, rocket_params, state_dynamics)
+        initial_conditions = np.array(list(initial_conditions_dict.values()))
+        terminal_conditions = np.array(list(terminal_conditions_dict.values()))
         result = zem_zev_pdg.find_best_trajectory(initial_conditions, terminal_conditions, t_min, t_max, t_tol, r_tol, v_tol, N, N_final, N_pred, verbose)
         results.append(result)
         if not result['success']:
@@ -449,6 +444,8 @@ def main():
         traj_plot.plot_single_run(successful_runs[0], N_final, planet_params['R'])
         # comparison = traj_val.compare_optimized_vs_simulated_trajectories(dynamics_np, initial_conditions, successful_runs[0], planet_params, rocket_params, N_final)
         # traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N_final)
+        # traj_plot.animate_trajectory(successful_runs[0], N_final, planet_params['R'])
+        traj_plot.animate_trajectory(successful_runs[0], N_final, planet_params['R'], thrust_scale=0.005, interval=1)
     if (num_runs > 1 and num_success > 0):
         traj_plot.plot_multiple_runs(successful_runs)
 

@@ -10,7 +10,6 @@
 # 8) Re-order functions to make reading flow easier
 # 9) Add 6-DOF dynamics
 
-from enum import IntEnum
 import numpy as np
 import casadi as ca
 from time import time
@@ -19,20 +18,7 @@ import trajectory_validation as traj_val
 import trajectory_plotting as traj_plot
 from zem_zev_powered_descent_guidance import ZEMZEVPoweredDescentGuidance
 
-class State(IntEnum):
-    X = 0
-    Y = 1
-    Z = 2
-    VX = 3
-    VY = 4
-    VZ = 5
-    M = 6
-
-class Control(IntEnum):
-    X = 0
-    Y = 1
-    Z = 2
-    GAMMA = 3 # Thrust magnitude slack variable for convex relaxation
+from common import State, Control
 
 def dynamics_scaled(state_scaled, control_scaled, planet_params, rocket_params, bounds, scale_factors, offsets):
     """
@@ -142,11 +128,11 @@ def dynamics_ca(state, control, planet_params, rocket_params):
     Aref = rocket_params['Aref']
     Cd = rocket_params['Cd']
 
-    r = np.sqrt(x**2 + y**2 + z**2)
+    r = ca.sqrt(x**2 + y**2 + z**2)
     h = r - R
-    rho = rho0 * np.exp(-h / H)
-    eps = 1e-8
-    v = np.sqrt(vx**2 + vy**2 + vz**2 + eps)
+    rho = rho0 * ca.exp(-h / H)
+    eps = 1.0e-8
+    v = ca.sqrt(vx**2 + vy**2 + vz**2 + eps)
     D = -0.5 * rho * Cd * Aref * v * ca.vertcat(vx, vy, vz)
     Dx = D[0]
     Dy = D[1]
@@ -183,7 +169,7 @@ class HermiteSimpsonPoweredDescentGuidance:
         self.bounds_scaled = None
         self.N = None
 
-    def generate_trajectory(self, initial_conditions: dict, terminal_conditions: dict, bounds: dict, landing_tolerances: dict, scale_factors: dict, offsets: dict, N: int):
+    def generate_trajectory(self, initial_conditions: np.ndarray, terminal_conditions: np.ndarray, bounds: dict, landing_tolerances: dict, scale_factors: dict, offsets: dict, N: int):
         """
         Main entry point to solve the trajectory.
         """
@@ -213,56 +199,95 @@ class HermiteSimpsonPoweredDescentGuidance:
 
     def _create_scaled_optimization_variables(self):
         # Scaled state variables = [x, y, z, vx, vy, vz, m]
-        num_states = 7
+        self.num_states = 7
 
         # Scaled control variables = [ux, uy, uz, gamma]
         # NOTE: Gamma is a thrust magnitude slack variable for convex relaxation
-        num_controls = 4
+        self.num_controls = 4
 
         return {
-            'X': self.opti.variable(num_states, self.N+1),
-            'U': self.opti.variable(num_controls, self.N+1),
+            'X': self.opti.variable(self.num_states, self.N+1),
+            'U': self.opti.variable(self.num_controls, self.N+1),
             'tf': self.opti.variable(),
             'slack_surface': self.opti.variable(1, self.N+1)
         }
 
-    def _scale_state(self, state: dict, scale_factors: dict, offsets: dict):
-        return {
-            'x': (state['x'] - offsets['x']) / scale_factors['x'],
-            'y': (state['y'] - offsets['y']) / scale_factors['y'],
-            'z': (state['z'] - offsets['z']) / scale_factors['z'],
-            'vx': (state['vx'] - offsets['vx']) / scale_factors['vx'],
-            'vy': (state['vy'] - offsets['vy']) / scale_factors['vy'],
-            'vz': (state['vz'] - offsets['vz']) / scale_factors['vz'],
-            'm': (state['m'] - offsets['m']) / scale_factors['m']
-        }
-
-    def _unscale_state(self, state_scaled: np.ndarray, scale_factors: dict, offsets: dict):
-        x = state_scaled[State.X] * scale_factors['x'] + offsets['x']
-        y = state_scaled[State.Y] * scale_factors['y'] + offsets['y']
-        z = state_scaled[State.Z] * scale_factors['z'] + offsets['z']
-        vx = state_scaled[State.VX] * scale_factors['vx'] + offsets['vx']
-        vy = state_scaled[State.VY] * scale_factors['vy'] + offsets['vy']
-        vz = state_scaled[State.VZ] * scale_factors['vz'] + offsets['vz']
-        m = state_scaled[State.M] * scale_factors['m'] + offsets['m']
+    def _scale_state(self, state, scale_factors: dict, offsets: dict):
+        x = (state[State.X] - offsets['x']) / scale_factors['x']
+        y = (state[State.Y] - offsets['y']) / scale_factors['y']
+        z = (state[State.Z] - offsets['z']) / scale_factors['z']
+        vx = (state[State.VX] - offsets['vx']) / scale_factors['vx']
+        vy = (state[State.VY] - offsets['vy']) / scale_factors['vy']
+        vz = (state[State.VZ] - offsets['vz']) / scale_factors['vz']
+        m = (state[State.M] - offsets['m']) / scale_factors['m']
 
         return np.array([x, y, z, vx, vy, vz, m])
 
-    def _scale_control(self, control: dict, scale_factors: dict, offsets: dict):
-        return {
-            'ux': (control['ux'] - offsets['ux']) / scale_factors['ux'],
-            'uy': (control['uy'] - offsets['uy']) / scale_factors['uy'],
-            'uz': (control['uz'] - offsets['uz']) / scale_factors['uz'],
-            'gamma': (control['gamma'] - offsets['gamma']) / scale_factors['gamma']
-        }
+    def _scale_states(self, state, scale_factors: dict, offsets: dict):
+        x =(state[State.X, :] - offsets['x']) / scale_factors['x']
+        y = (state[State.Y, :] - offsets['y']) / scale_factors['y']
+        z = (state[State.Z, :] - offsets['z']) / scale_factors['z']
+        vx = (state[State.VX, :] - offsets['vx']) / scale_factors['vx']
+        vy = (state[State.VY, :] - offsets['vy']) / scale_factors['vy']
+        vz = (state[State.VZ, :] - offsets['vz']) / scale_factors['vz']
+        m = (state[State.M, :] - offsets['m']) / scale_factors['m']
 
-    def _unscale_control(self, control_scaled: np.ndarray, scale_factors: dict, offsets: dict):
-        ux = control_scaled[Control.X] * scale_factors['ux'] + offsets['ux']
-        uy = control_scaled[Control.Y] * scale_factors['uy'] + offsets['uy']
-        uz = control_scaled[Control.Z] * scale_factors['uz'] + offsets['uz']
-        gamma = control_scaled[Control.GAMMA] * scale_factors['gamma'] + offsets['gamma']
+        if isinstance(state, (ca.MX, ca.SX, ca.DM)):
+            print("CasADi state variable detected, using vertcat for scaling")
+            return ca.vertcat(x, y, z, vx, vy, vz, m)
+        else:
+            print("NumPy state variable detected, using vstack for scaling")
+            return np.vstack([x, y, z, vx, vy, vz, m])
+
+    def _unscale_states(self, state_scaled, scale_factors: dict, offsets: dict):
+        x = state_scaled[State.X, :] * scale_factors['x'] + offsets['x']
+        y = state_scaled[State.Y, :] * scale_factors['y'] + offsets['y']
+        z = state_scaled[State.Z, :] * scale_factors['z'] + offsets['z']
+        vx = state_scaled[State.VX, :] * scale_factors['vx'] + offsets['vx']
+        vy = state_scaled[State.VY, :] * scale_factors['vy'] + offsets['vy']
+        vz = state_scaled[State.VZ, :] * scale_factors['vz'] + offsets['vz']
+        m = state_scaled[State.M, :] * scale_factors['m'] + offsets['m']
+
+        if isinstance(state_scaled, (ca.MX, ca.SX, ca.DM)):
+            print("CasADi state variable detected, using vertcat for unscaling")
+            return ca.vertcat(x, y, z, vx, vy, vz, m)
+        else:
+            print("NumPy state variable detected, using vstack for unscaling")
+            return np.vstack([x, y, z, vx, vy, vz, m])
+
+    def _scale_control(self, control, scale_factors: dict, offsets: dict):
+        ux = (control[Control.X] - offsets['ux']) / scale_factors['ux']
+        uy = (control[Control.Y] - offsets['uy']) / scale_factors['uy']
+        uz = (control[Control.Z] - offsets['uz']) / scale_factors['uz']
+        gamma = (control[Control.GAMMA] - offsets['gamma']) / scale_factors['gamma']
 
         return np.array([ux, uy, uz, gamma])
+
+    def _scale_controls(self, control, scale_factors: dict, offsets: dict):
+        ux = (control[Control.X, :] - offsets['ux']) / scale_factors['ux']
+        uy = (control[Control.Y, :] - offsets['uy']) / scale_factors['uy']
+        uz = (control[Control.Z, :] - offsets['uz']) / scale_factors['uz']
+        gamma = (control[Control.GAMMA, :] - offsets['gamma']) / scale_factors['gamma']
+
+        if isinstance(control, (ca.MX, ca.SX, ca.DM)):
+            print("CasADi control variable detected, using vertcat for scaling")
+            return ca.vertcat(ux, uy, uz, gamma)
+        else:
+            print("NumPy control variable detected, using vstack for scaling")
+            return np.vstack([ux, uy, uz, gamma])
+
+    def _unscale_controls(self, control_scaled, scale_factors: dict, offsets: dict):
+        ux = control_scaled[Control.X, :] * scale_factors['ux'] + offsets['ux']
+        uy = control_scaled[Control.Y, :] * scale_factors['uy'] + offsets['uy']
+        uz = control_scaled[Control.Z, :] * scale_factors['uz'] + offsets['uz']
+        gamma = control_scaled[Control.GAMMA, :] * scale_factors['gamma'] + offsets['gamma']
+
+        if isinstance(control_scaled, (ca.MX, ca.SX, ca.DM)):
+            print("CasADi control variable detected, using vertcat for unscaling")
+            return ca.vertcat(ux, uy, uz, gamma)
+        else:
+            print("NumPy control variable detected, using vstack for unscaling")
+            return np.vstack([ux, uy, uz, gamma])
 
     def _scale_time(self, time: float, scale_factors: dict, offsets: dict):
         return (time - offsets['t']) / scale_factors['t']
@@ -272,12 +297,8 @@ class HermiteSimpsonPoweredDescentGuidance:
 
     def _scale_landing_tolerances(self, landing_tolerances: dict, scale_factors: dict):
         return {
-            'x': (landing_tolerances['x']) / scale_factors['x'],
-            'y': (landing_tolerances['y']) / scale_factors['y'],
-            'z': (landing_tolerances['z']) / scale_factors['z'],
-            'vx': (landing_tolerances['vx']) / scale_factors['vx'],
-            'vy': (landing_tolerances['vy']) / scale_factors['vy'],
-            'vz': (landing_tolerances['vz']) / scale_factors['vz']
+            'position': (landing_tolerances['position']) / scale_factors['x'],
+            'velocity': (landing_tolerances['velocity']) / scale_factors['vx'],
         }
 
     def _scale_bounds(self, bounds: dict, scale_factors: dict, offsets: dict):
@@ -291,25 +312,25 @@ class HermiteSimpsonPoweredDescentGuidance:
     def _add_boundary_constraints(self):
         # State constraints at initial and final time steps
         X_scaled = self.opt_vars_scaled['X']
+        assert(X_scaled.shape == (self.num_states, self.N+1))
 
         # Initial state constraints
         X0_scaled = self.initial_conditions_scaled
-        self.opti.subject_to(X_scaled[State.X, 0] == X0_scaled['x'])
-        self.opti.subject_to(X_scaled[State.Y, 0] == X0_scaled['y'])
-        self.opti.subject_to(X_scaled[State.Z, 0] == X0_scaled['z'])
-        self.opti.subject_to(X_scaled[State.VX, 0] == X0_scaled['vx'])
-        self.opti.subject_to(X_scaled[State.VY, 0] == X0_scaled['vy'])
-        self.opti.subject_to(X_scaled[State.VZ, 0] == X0_scaled['vz'])
-        self.opti.subject_to(X_scaled[State.M, 0] == X0_scaled['m'])
+        self.opti.subject_to(X_scaled[:, 0] == X0_scaled)
 
         # Final state constraints
         Xf_scaled = self.terminal_conditions_scaled
-        self.opti.subject_to(self.opti.bounded(Xf_scaled['x'] - self.landing_tolerances_scaled['x'], X_scaled[State.X, -1], Xf_scaled['x'] + self.landing_tolerances_scaled['x']))
-        self.opti.subject_to(self.opti.bounded(Xf_scaled['y'] - self.landing_tolerances_scaled['y'], X_scaled[State.Y, -1], Xf_scaled['y'] + self.landing_tolerances_scaled['y']))
-        self.opti.subject_to(self.opti.bounded(Xf_scaled['z'] - self.landing_tolerances_scaled['z'], X_scaled[State.Z, -1], Xf_scaled['z'] + self.landing_tolerances_scaled['z']))
-        self.opti.subject_to(self.opti.bounded(Xf_scaled['vx'] - self.landing_tolerances_scaled['vx'], X_scaled[State.VX, -1], Xf_scaled['vx'] + self.landing_tolerances_scaled['vx']))
-        self.opti.subject_to(self.opti.bounded(Xf_scaled['vy'] - self.landing_tolerances_scaled['vy'], X_scaled[State.VY, -1], Xf_scaled['vy'] + self.landing_tolerances_scaled['vy']))
-        self.opti.subject_to(self.opti.bounded(Xf_scaled['vz'] - self.landing_tolerances_scaled['vz'], X_scaled[State.VZ, -1], Xf_scaled['vz'] + self.landing_tolerances_scaled['vz']))
+        pos_tol = self.landing_tolerances_scaled['position']
+        vel_tol = self.landing_tolerances_scaled['velocity']
+        self.opti.subject_to(self.opti.bounded(Xf_scaled[State.X:State.Z+1] - pos_tol, X_scaled[State.X:State.Z+1, -1], Xf_scaled[State.X:State.Z+1] + pos_tol))
+        self.opti.subject_to(self.opti.bounded(Xf_scaled[State.VX:State.VZ+1] - vel_tol, X_scaled[State.VX:State.VZ+1, -1], Xf_scaled[State.VX:State.VZ+1] + vel_tol))
+
+        # self.opti.subject_to(self.opti.bounded(Xf_scaled[State.X] - pos_tol, X_scaled[State.X, -1], Xf_scaled[State.X] + pos_tol))
+        # self.opti.subject_to(self.opti.bounded(Xf_scaled[State.Y] - pos_tol, X_scaled[State.Y, -1], Xf_scaled[State.Y] + pos_tol))
+        # self.opti.subject_to(self.opti.bounded(Xf_scaled[State.Z] - pos_tol, X_scaled[State.Z, -1], Xf_scaled[State.Z] + pos_tol))
+        # self.opti.subject_to(self.opti.bounded(Xf_scaled[State.VX] - vel_tol, X_scaled[State.VX, -1], Xf_scaled[State.VX] + vel_tol))
+        # self.opti.subject_to(self.opti.bounded(Xf_scaled[State.VY] - vel_tol, X_scaled[State.VY, -1], Xf_scaled[State.VY] + vel_tol))
+        # self.opti.subject_to(self.opti.bounded(Xf_scaled[State.VZ] - vel_tol, X_scaled[State.VZ, -1], Xf_scaled[State.VZ] + vel_tol))
 
         # Time constraint
         tf_scaled = self.opt_vars_scaled['tf']
@@ -319,7 +340,7 @@ class HermiteSimpsonPoweredDescentGuidance:
         # Keep vehicle above surface (r >= R)
         X_scaled = self.opt_vars_scaled['X']
         # Using physical units since x, y and z scales might differ
-        X = self._unscale_state(X_scaled, self.scale_factors, self.offsets)
+        X = self._unscale_states(X_scaled, self.scale_factors, self.offsets)
         slack_surface = self.opt_vars_scaled['slack_surface']
         self.opti.subject_to(slack_surface >= 0.0)
         # IMPORTANT: Normalizing by R to keep gradients well-scaled (r >= R => r/R >= 1), and using slack variable to improve convergence
@@ -336,7 +357,7 @@ class HermiteSimpsonPoweredDescentGuidance:
 
         # Mass constraints
         m_scaled = X_scaled[State.M, :]
-        mf_scaled = self.terminal_conditions_scaled['m']
+        mf_scaled = self.terminal_conditions_scaled[State.M]
         # Keep mass above dry-mass lower bound everywhere
         self.opti.subject_to(m_scaled >= mf_scaled)
 
@@ -396,72 +417,39 @@ class HermiteSimpsonPoweredDescentGuidance:
         zem_zev_trajectory = zem_zev_pdg.find_best_trajectory(self.initial_conditions, self.terminal_conditions, t_min, t_max, t_tol, r_tol, v_tol, self.N, N_final, N_pred)
 
         if (zem_zev_trajectory['success']):
-            print("Valid ZEM/ZEV trajectory found with time of flight:", zem_zev_trajectory['tf_opt'])
+            print("Valid ZEM/ZEV trajectory found with time of flight:", zem_zev_trajectory['tf'])
 
             stride = k # Sub-sample the ZEM/ZEV trajectory to match the number of optimization nodes (N+1)
 
-            X_guess = dict()
-            X_guess['x'] = zem_zev_trajectory['x_opt'][::stride]
-            X_guess['y'] = zem_zev_trajectory['y_opt'][::stride]
-            X_guess['z'] = zem_zev_trajectory['z_opt'][::stride]
-            X_guess['vx'] = zem_zev_trajectory['vx_opt'][::stride]
-            X_guess['vy'] = zem_zev_trajectory['vy_opt'][::stride]
-            X_guess['vz'] = zem_zev_trajectory['vz_opt'][::stride]
-            X_guess['m'] = zem_zev_trajectory['m_opt'][::stride]
+            tf_guess = zem_zev_trajectory['tf']
+            X_guess = zem_zev_trajectory['X'][::stride]
 
-            U_guess = dict()
-            U_guess['ux'] = zem_zev_trajectory['ux_opt'][::stride]
-            U_guess['uy'] = zem_zev_trajectory['uy_opt'][::stride]
-            U_guess['uz'] = zem_zev_trajectory['uz_opt'][::stride]
-            U_guess['gamma'] = np.sqrt(U_guess['ux']**2 + U_guess['uy']**2 + U_guess['uz']**2)
-
-            tf_guess = zem_zev_trajectory['tf_opt']
+            U_guess = zem_zev_trajectory['U'][::stride]
+            U_guess_gamma = np.sqrt(U_guess[Control.X]**2 + U_guess[Control.Y]**2 + U_guess[Control.Z]**2)
+            U_guess = np.vstack((U_guess, U_guess_gamma)) # Add gamma as the last row of the control guess for convex relaxation
 
             tf_guess_scaled = self._scale_time(tf_guess, self.scale_factors, self.offsets)
-            X_guess_scaled = self._scale_state(X_guess, self.scale_factors, self.offsets)
-            U_guess_scaled = self._scale_control(U_guess, self.scale_factors, self.offsets)
+            X_guess_scaled = self._scale_states(X_guess, self.scale_factors, self.offsets)
+            U_guess_scaled = self._scale_controls(U_guess, self.scale_factors, self.offsets)
 
             # Initial guess solution: Use ZEM/ZEV trajectory for states, controls and final time
             self.opti.set_initial(tf_scaled, tf_guess_scaled)
-
-            self.opti.set_initial(X_scaled[State.X, :], X_guess_scaled['x'])
-            self.opti.set_initial(X_scaled[State.Y, :], X_guess_scaled['y'])
-            self.opti.set_initial(X_scaled[State.Z, :], X_guess_scaled['z'])
-            self.opti.set_initial(X_scaled[State.VX, :], X_guess_scaled['vx'])
-            self.opti.set_initial(X_scaled[State.VY, :], X_guess_scaled['vy'])
-            self.opti.set_initial(X_scaled[State.VZ, :], X_guess_scaled['vz'])
-            self.opti.set_initial(X_scaled[State.M, :], X_guess_scaled['m'])
-
-            self.opti.set_initial(U_scaled[Control.X, :], U_guess_scaled['ux'])
-            self.opti.set_initial(U_scaled[Control.Y, :], U_guess_scaled['uy'])
-            self.opti.set_initial(U_scaled[Control.Z, :], U_guess_scaled['uz'])
-            self.opti.set_initial(U_scaled[Control.GAMMA, :], U_guess_scaled['gamma'])
-
+            self.opti.set_initial(X_scaled, X_guess_scaled)
+            self.opti.set_initial(U_scaled, U_guess_scaled)
         else:
             print("Valid ZEM/ZEV trajectory not found, using linear interpolation initial guess instead")
             # Initial guess solution: Linear interpolation between boundary conditions for states, and min thrust for controls
             X0_scaled = self.initial_conditions_scaled
             Xf_scaled = self.terminal_conditions_scaled
 
-            for i in range(self.N+1):
-                # Linear interpolation initial guess for states
-                t_frac = i / self.N
-                self.opti.set_initial(X_scaled[State.X, i], (1.0 - t_frac)*X0_scaled['x'] + t_frac*Xf_scaled['x'])
-                self.opti.set_initial(X_scaled[State.Y, i], (1.0 - t_frac)*X0_scaled['y'] + t_frac*Xf_scaled['y'])
-                self.opti.set_initial(X_scaled[State.Z, i], (1.0 - t_frac)*X0_scaled['z'] + t_frac*Xf_scaled['z'])
-                self.opti.set_initial(X_scaled[State.VX, i], (1.0 - t_frac)*X0_scaled['vx'] + t_frac*Xf_scaled['vx'])
-                self.opti.set_initial(X_scaled[State.VY, i], (1.0 - t_frac)*X0_scaled['vy'] + t_frac*Xf_scaled['vy'])
-                self.opti.set_initial(X_scaled[State.VZ, i], (1.0 - t_frac)*X0_scaled['vz'] + t_frac*Xf_scaled['vz'])
-                self.opti.set_initial(X_scaled[State.M, i], (1.0 - t_frac)*X0_scaled['m'] + t_frac*Xf_scaled['m'])
-
-                # Min thrust initial guess for controls
-                self.opti.set_initial(U_scaled[Control.X, i], self.bounds_scaled['u_min'])
-                self.opti.set_initial(U_scaled[Control.Y, i], self.bounds_scaled['u_min'])
-                self.opti.set_initial(U_scaled[Control.Z, i], self.bounds_scaled['u_min'])
-                self.opti.set_initial(U_scaled[Control.GAMMA,  i], self.bounds_scaled['u_min'])
-
             # Initial guess for time horizon
             self.opti.set_initial(tf_scaled, (self.bounds_scaled['t_min'] + self.bounds_scaled['t_max']) / 2.0)
+            for i in range(self.N+1):
+                t_frac = i / self.N
+                # Linear interpolation initial guess for states
+                self.opti.set_initial(X_scaled[:, i], (1.0 - t_frac)*X0_scaled + t_frac*Xf_scaled)
+                # Min thrust initial guess for controls
+                self.opti.set_initial(U_scaled[:, i], self.bounds_scaled['u_min'])
 
         # Initialize slack on surface constraint to zero
         self.opti.set_initial(slack_surface, 0.0)
@@ -478,8 +466,8 @@ class HermiteSimpsonPoweredDescentGuidance:
     def _solve(self):
         # Set up solver
         ipopt_options = {
-            'ipopt.print_level': 5,
             'expand': True,
+            'ipopt.print_level': 5,
             'ipopt.max_iter': 500,
             'ipopt.tol': 1e-6,
             'ipopt.linear_solver': 'mumps',
@@ -542,7 +530,6 @@ class HermiteSimpsonPoweredDescentGuidance:
             # plt.tight_layout()
             # plt.show()
 
-            # Extract and unscale solution
             X_scaled = self.opt_vars_scaled['X']
             U_scaled = self.opt_vars_scaled['U']
             tf_scaled = self.opt_vars_scaled['tf']
@@ -553,8 +540,9 @@ class HermiteSimpsonPoweredDescentGuidance:
             print("Max scaled control magnitudes:", np.max(sol.value(U_scaled), axis=1))
             print("Final scaled time:", sol.value(tf_scaled))
 
-            X = self._unscale_state(sol.value(X_scaled), self.scale_factors, self.offsets)
-            U = self._unscale_control(sol.value(U_scaled), self.scale_factors, self.offsets)
+            # Extract and unscale solution
+            X = self._unscale_states(sol.value(X_scaled), self.scale_factors, self.offsets)
+            U = self._unscale_controls(sol.value(U_scaled), self.scale_factors, self.offsets)
             tf = self._unscale_time(sol.value(tf_scaled), self.scale_factors, self.offsets)
 
             print(f"--- Run succeeded ---")
@@ -565,18 +553,9 @@ class HermiteSimpsonPoweredDescentGuidance:
                 "success": True,
                 "iterations": iterations,
                 "solve_time": t_solve,
-                "tf_opt": tf,
-                "x_opt": X[State.X, :],
-                "y_opt": X[State.Y, :],
-                "z_opt": X[State.Z, :],
-                "vx_opt": X[State.VX, :],
-                "vy_opt": X[State.VY, :],
-                "vz_opt": X[State.VZ, :],
-                "m_opt": X[State.M, :],
-                "ux_opt": U[Control.X, :],
-                "uy_opt": U[Control.Y, :],
-                "uz_opt": U[Control.Z, :],
-                "gamma_opt": U[Control.GAMMA, :]
+                "tf": tf,
+                "X": X,
+                "U": U,
             }
         except Exception as e:
             print(f"--- Run failed: {e} ---")
@@ -606,7 +585,7 @@ def main():
     }
 
     # Fixed terminal conditions for all runs
-    terminal_conditions = {
+    terminal_conditions_dict = {
         'x': 0.0, # Final x-position (m)
         'y': 0.0, # Final y-position (m)
         'z': planet_params['R'], # Final z-position (m)
@@ -626,12 +605,8 @@ def main():
 
     # Position and velocity tolerances for terminal constraints
     landing_tolerances = {
-        'x': 1.0,    # Position tolerance (m)
-        'y': 1.0,    # Position tolerance (m)
-        'z': 1.0,    # Position tolerance (m)
-        'vx': 0.5,    # Velocity tolerance (m/s)
-        'vy': 0.5,    # Velocity tolerance (m/s)
-        'vz': 0.5,    # Velocity tolerance (m/s)
+        'position': 1.0, # (m)
+        'velocity': 0.5, # (m/s)
     }
 
     N = 50 # Number of control intervals
@@ -644,7 +619,7 @@ def main():
     for i in range(num_runs):
         print(f"--- Starting run {i+1}/{num_runs} ---")
         # Randomized initial conditions
-        initial_conditions = {
+        initial_conditions_dict = {
             'x': np.random.uniform(-50000.0, 50000.0), # m
             'y': np.random.uniform(-50000.0, 50000.0), # m
             'z': planet_params['R'] + np.random.uniform(50000.0, 150000.0), # m
@@ -686,9 +661,11 @@ def main():
             't': 0.0
         }
 
-        print(f"Initial conditions (run {i+1}): {initial_conditions}")
+        print(f"Initial conditions (run {i+1}): {initial_conditions_dict}")
 
         hermite_simpson_pdg = HermiteSimpsonPoweredDescentGuidance(planet_params, rocket_params, dynamics_scaled)
+        initial_conditions = np.array(list(initial_conditions_dict.values()))
+        terminal_conditions = np.array(list(terminal_conditions_dict.values()))
         result = hermite_simpson_pdg.generate_trajectory(initial_conditions, terminal_conditions, bounds, landing_tolerances, scale_factors, offsets, N)
         results.append(result)
         if not result['success']:
@@ -713,8 +690,9 @@ def main():
 
     if (num_runs == 1 and num_success == 1):
         traj_plot.plot_single_run(successful_runs[0], N, planet_params['R'])
-        comparison = traj_val.compare_optimized_vs_simulated_trajectories(dynamics_np, initial_conditions, successful_runs[0], planet_params, rocket_params, N)
-        traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N)
+        # comparison = traj_val.compare_optimized_vs_simulated_trajectories(dynamics_np, initial_conditions_dict, successful_runs[0], planet_params, rocket_params, N)
+        # traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N)
+        traj_plot.animate_trajectory(successful_runs[0], N, planet_params['R'], thrust_scale=0.005, interval=1)
     elif (num_runs > 1 and num_success > 0):
         traj_plot.plot_multiple_runs(successful_runs)
 
