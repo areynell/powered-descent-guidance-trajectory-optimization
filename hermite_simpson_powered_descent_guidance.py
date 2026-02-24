@@ -1,14 +1,11 @@
 # TODO:
 # 0) Plot planet's surface near landing site, and add linear surface constraint instead of radial constraint
-# 1) Split path constraints, initial guesses, and objective function into separate functions for clarity
-# 2) Add glide-slope constraint near landing site
-# 3) Make 2D animation of trajectory and control input
-# 4) Use polynomial trajectories for state and controls that match collocation method
-# 5) Plot midpoints as well
-# 6) Try different collocation methods
-# 7) Add rotation of planet
-# 8) Re-order functions to make reading flow easier
-# 9) Add 6-DOF dynamics
+# 1) Add glide-slope constraint near landing site
+# 2) Use polynomial trajectories for state and controls that match collocation method
+# 3) Implement different collocation methods
+# 4) Add rotation of planet
+# 5) Re-order functions to make reading flow easier
+# 6) Add 6-DOF dynamics
 
 import numpy as np
 import casadi as ca
@@ -609,7 +606,7 @@ def main():
     }
 
     N = 50 # Number of control intervals
-    num_runs = 100 # Number of randomized runs to perform
+    num_runs = 1 # Number of randomized runs to perform
 
     results = []
     failed_initial_conditions = []
@@ -688,7 +685,7 @@ def main():
         traj_plot.plot_single_run(successful_runs[0], N, planet_params['R'])
         # comparison = traj_val.compare_optimized_vs_simulated_trajectories(dynamics_np, initial_conditions_dict, successful_runs[0], planet_params, rocket_params, N)
         # traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N)
-        traj_plot.animate_trajectory(successful_runs[0], N, planet_params['R'], thrust_scale=0.005, interval=1)
+        traj_plot.animate_trajectory(successful_runs[0], N, planet_params['R'], thrust_scale=0.005, interval=1, mode='rocket')
     elif (num_runs > 1 and num_success > 0):
         traj_plot.plot_multiple_runs(successful_runs)
 

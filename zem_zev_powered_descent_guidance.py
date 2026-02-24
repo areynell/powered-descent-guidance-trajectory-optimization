@@ -393,7 +393,7 @@ def main():
     terminal_conditions[State.VZ] = 0.0
     terminal_conditions[State.M] = rocket_params['mass_dry']
 
-    num_runs = 100
+    num_runs = 1
     N = 50 # Number of integration steps in generated trajectories during line search
     N_final = 10*N # Number of integration steps in final optimized trajectory
     N_pred = 10 # Number of integration steps for ZEM/ZEV prediction
@@ -441,7 +441,7 @@ def main():
         # comparison = traj_val.compare_optimized_vs_simulated_trajectories(dynamics_np, initial_conditions, successful_runs[0], planet_params, rocket_params, N_final)
         # traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N_final)
         # traj_plot.animate_trajectory(successful_runs[0], N_final, planet_params['R'])
-        traj_plot.animate_trajectory(successful_runs[0], N_final, planet_params['R'], thrust_scale=0.005, interval=1)
+        traj_plot.animate_trajectory(successful_runs[0], N_final, planet_params['R'], thrust_scale=0.005, interval=1, mode='rocket')
     if (num_runs > 1 and num_success > 0):
         traj_plot.plot_multiple_runs(successful_runs)
 

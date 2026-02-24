@@ -142,10 +142,10 @@ def plot_multiple_runs(trajectories):
     ax.legend()
     plt.show()
 
-
-def animate_trajectory(trajectory, N, R, thrust_scale=0.01, interval=50, num_frames=300):
+def animate_trajectory(trajectory, N, R, thrust_scale=0.01, interval=50, num_frames=300, mode='rocket'):
     """
-    Animate the position of the point mass with thrust vector.
+    mode: 'rocket' to display a simple rocket body and nozzle flame, or
+          'point' to display a point mass with a thrust vector.
     """
 
     tf = trajectory['tf']
@@ -175,7 +175,7 @@ def animate_trajectory(trajectory, N, R, thrust_scale=0.01, interval=50, num_fra
     y_min, y_max = y_interp.min(), y_interp.max()
     z_min, z_max = z_interp.min(), z_interp.max()
 
-    fig = plt.figure(figsize=(10, 10))
+    fig = plt.figure(figsize=(12, 12))
     ax  = fig.add_subplot(111, projection='3d')
 
     # Full trajectory
@@ -197,11 +197,24 @@ def animate_trajectory(trajectory, N, R, thrust_scale=0.01, interval=50, num_fra
     proj_xz = ax.plot([], [], [], 'k.', markersize=10, alpha=0.3)[0]
     proj_yz = ax.plot([], [], [], 'k.', markersize=10, alpha=0.3)[0]
 
-    thrust_vectors = [None]
+    if mode == 'rocket':
+        rocket_body = ax.plot([], [], [], color='black', linewidth=8, solid_capstyle='round')[0]
+        rocket_flame = ax.plot([], [], [], color='red', linewidth=3)[0]
+    elif mode == 'point':
+        thrust_vectors = [None]
+    else:
+        raise ValueError("Invalid mode. Use 'rocket' or 'point'.")
 
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(y_min, y_max)
     ax.set_zlim(z_min, z_max)
+
+    # Force equal aspect ratio so the rocket doesn't stretch when rotating
+    x_range = max(x_max - x_min, 1.0e-6)
+    y_range = max(y_max - y_min, 1.0e-6)
+    z_range = max(z_max - z_min, 1.0e-6)
+    ax.set_box_aspect((x_range, y_range, z_range))
+
     ax.set_xlabel('x (m)')
     ax.set_ylabel('y (m)')
     ax.set_zlabel('z (m)')
@@ -229,22 +242,52 @@ def animate_trajectory(trajectory, N, R, thrust_scale=0.01, interval=50, num_fra
         proj_xz.set_3d_properties([z_interp[frame]])
         proj_yz.set_3d_properties([z_interp[frame]])
 
-        # Thrust quiver
-        if thrust_vectors[0] is not None:
-            thrust_vectors[0].remove()
-            thrust_vectors[0] = None
-
         thrust_mag = np.sqrt(ux_interp[frame]**2 + uy_interp[frame]**2 + uz_interp[frame]**2)
-        if thrust_mag > 1.0:
-            thrust_vectors[0] = ax.quiver(
-                x_interp[frame], y_interp[frame], z_interp[frame],
-                ux_interp[frame], uy_interp[frame], uz_interp[frame],
-                length=thrust_mag * thrust_scale,
-                normalize=True, color='r', alpha=1.0
-            )
+        artists = [path, current_position, proj_xy, proj_xz, proj_yz, time_text]
+
+        if mode == 'rocket':
+            # Calculate orientation (default to pointing up if no thrust)
+            if thrust_mag > 1.0e-6:
+                dx = ux_interp[frame] / thrust_mag
+                dy = uy_interp[frame] / thrust_mag
+                dz = uz_interp[frame] / thrust_mag
+            else:
+                dx = 0.0
+                dy = 0.0
+                dz = 1.0
+
+            # Scale rocket body length to be 5% of the maximum axis range for visibility
+            rocket_length = max(x_range, y_range, z_range) * 0.05
+
+            # Rocket body (pointing along thrust vector)
+            rocket_body.set_data([x_interp[frame], x_interp[frame] + dx * rocket_length], [y_interp[frame], y_interp[frame] + dy * rocket_length])
+            rocket_body.set_3d_properties([z_interp[frame], z_interp[frame] + dz * rocket_length])
+
+            # Rocket flame (pointing opposite to thrust vector)
+            flame_length = thrust_mag * thrust_scale if thrust_mag > 1.0 else 0.0
+            rocket_flame.set_data([x_interp[frame], x_interp[frame] - dx * flame_length], [y_interp[frame], y_interp[frame] - dy * flame_length])
+            rocket_flame.set_3d_properties([z_interp[frame], z_interp[frame] - dz * flame_length])
+
+            artists.extend([rocket_body, rocket_flame])
+        elif mode == 'point':
+            # Thrust quiver
+            if thrust_vectors[0] is not None:
+                thrust_vectors[0].remove()
+                thrust_vectors[0] = None
+
+            if thrust_mag > 1.0:
+                thrust_vectors[0] = ax.quiver(
+                    x_interp[frame], y_interp[frame], z_interp[frame],
+                    ux_interp[frame], uy_interp[frame], uz_interp[frame],
+                    length=thrust_mag * thrust_scale,
+                    normalize=True, color='r', alpha=1.0
+                )
+                artists.append(thrust_vectors[0])
+        else:
+            raise ValueError("Invalid mode. Use 'rocket' or 'point'.")
 
         time_text.set_text(f't = {t_dense[frame]:.1f} s')
-        return path, current_position, proj_xy, proj_xz, proj_yz, time_text, thrust_vectors[0]
+        return artists
 
     anim = FuncAnimation(fig, update, frames=num_frames, init_func=init, interval=interval, blit=False)
 
