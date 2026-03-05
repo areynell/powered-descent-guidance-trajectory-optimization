@@ -14,142 +14,13 @@ from time import time
 import trajectory_validation as traj_val
 import trajectory_plotting as traj_plot
 from zem_zev_powered_descent_guidance import ZEMZEVPoweredDescentGuidance
-
 from common import State, Control
 
-def dynamics_scaled(state_scaled, control_scaled, planet_params, rocket_params, bounds, scale_factors, offsets):
-    """
-    Scaled dynamics in non-dimensional units.
-    state = [x, y, z, vx, vy, vz, m] (scaled)
-    control = [ux, uy, uz, gamma] (scaled)
-    returns scaled derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt, dvz/dt, dm/dt]
-    computed by unscaling the inputs, calling dynamics(), and rescaling the outputs.
-    """
-    T = scale_factors['t']
-    S_x = np.vstack((scale_factors['x'],
-                     scale_factors['y'],
-                     scale_factors['z'],
-                     scale_factors['vx'],
-                     scale_factors['vy'],
-                     scale_factors['vz'],
-                     scale_factors['m']))
-    S_u = np.vstack((scale_factors['ux'],
-                     scale_factors['uy'],
-                     scale_factors['uz'],
-                     scale_factors['gamma']))
-
-    x_offsets = np.vstack((offsets['x'],
-                           offsets['y'],
-                           offsets['z'],
-                           offsets['vx'],
-                           offsets['vy'],
-                           offsets['vz'],
-                           offsets['m']))
-    u_offsets = np.vstack((offsets['ux'],
-                           offsets['uy'],
-                           offsets['uz'],
-                           offsets['gamma']))
-
-    x_scaled = state_scaled
-    u_scaled = control_scaled
-
-    return (T / S_x) * dynamics_ca(S_x*x_scaled + x_offsets, S_u*u_scaled + u_offsets, planet_params, rocket_params)
-
-# TODO: Generalize dynamics function to accept both CasADi and NumPy inputs, so we don't need to update both separately
-def dynamics_np(state, control, planet_params, rocket_params):
-    x, y, z, vx, vy, vz, m = state
-    ux, uy, uz = control
-
-    G = planet_params['G']
-    M = planet_params['M']
-    R = planet_params['R']
-    rho0 = planet_params['rho0']
-    H = planet_params['H']
-
-    Isp = rocket_params['Isp']
-    g0 = rocket_params['g0']
-    Aref = rocket_params['Aref']
-    Cd = rocket_params['Cd']
-
-    u_total = np.sqrt(ux**2 + uy**2 + uz**2)
-
-    r = np.sqrt(x**2 + y**2 + z**2)
-    h = r - R
-    rho = rho0 * np.exp(-h / H)
-    v = np.sqrt(vx**2 + vy**2 + vz**2)
-
-    D = -0.5 * rho * Cd * Aref * v * np.array([vx, vy, vz])
-    Dx = D[0]
-    Dy = D[1]
-    Dz = D[2]
-
-    dxdt = vx
-    dydt = vy
-    dzdt = vz
-    dvxdt = -G * M * (x / r**3) + ux / m + Dx / m
-    dvydt = -G * M * (y / r**3) + uy / m + Dy / m
-    dvzdt = -G * M * (z / r**3) + uz / m + Dz / m
-    dmdt = -u_total / (Isp * g0)
-
-    return np.array([dxdt, dydt, dzdt, dvxdt, dvydt, dvzdt, dmdt])
-
-# TODO: Generalize dynamics function to accept both CasADi and NumPy inputs, so we don't need to update both separately
-def dynamics_ca(state, control, planet_params, rocket_params):
-    """
-    Unscaled dynamics in physical units.
-    state = [x, y, z, vx, vy, vz, m]
-    control = [ux, uy, uz, gamma]
-    returns derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt, dvz/dt, dm/dt]
-    """
-    x = state[State.X]
-    y = state[State.Y]
-    z = state[State.Z]
-    vx = state[State.VX]
-    vy = state[State.VY]
-    vz = state[State.VZ]
-    m = state[State.M]
-
-    ux = control[Control.X]
-    uy = control[Control.Y]
-    uz = control[Control.Z]
-    gamma = control[Control.GAMMA]
-
-    G = planet_params['G']
-    M = planet_params['M']
-    R = planet_params['R']
-    rho0 = planet_params['rho0']
-    H = planet_params['H']
-
-    Isp = rocket_params['Isp']
-    g0 = rocket_params['g0']
-    Aref = rocket_params['Aref']
-    Cd = rocket_params['Cd']
-
-    r = ca.sqrt(x**2 + y**2 + z**2)
-    h = r - R
-    rho = rho0 * ca.exp(-h / H)
-    eps = 1.0e-8
-    v = ca.sqrt(vx**2 + vy**2 + vz**2 + eps)
-    D = -0.5 * rho * Cd * Aref * v * ca.vertcat(vx, vy, vz)
-    Dx = D[0]
-    Dy = D[1]
-    Dz = D[2]
-
-    dxdt = vx
-    dydt = vy
-    dzdt = vz
-    dvxdt = -G * M * (x / r**3) + ux / m + Dx / m
-    dvydt = -G * M * (y / r**3) + uy / m + Dy / m
-    dvzdt = -G * M * (z / r**3) + uz / m + Dz / m
-    dmdt = -gamma / (Isp * g0)
-
-    return ca.vertcat(dxdt, dydt, dzdt, dvxdt, dvydt, dvzdt, dmdt)
-
 class HermiteSimpsonPoweredDescentGuidance:
-    def __init__(self, planet_params: dict, rocket_params: dict, state_dynamics_func: callable):
+    def __init__(self, planet_params: dict, rocket_params: dict):
         self.planet_params = planet_params
         self.rocket_params = rocket_params
-        self.state_dynamics_func = state_dynamics_func
+        self.state_dynamics_func = self.dynamics_scaled
 
         self.opti = None
         self.opt_vars_scaled = None
@@ -193,6 +64,101 @@ class HermiteSimpsonPoweredDescentGuidance:
         self._compute_initial_solution_guess()
 
         return self._solve()
+
+    def dynamics_scaled(self, state_scaled, control_scaled, planet_params, rocket_params, bounds, scale_factors, offsets):
+        """
+        Scaled dynamics in non-dimensional units.
+        state = [x, y, z, vx, vy, vz, m] (scaled)
+        control = [ux, uy, uz, gamma] (scaled)
+        returns scaled derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt, dvz/dt, dm/dt]
+        computed by unscaling the inputs, calling dynamics(), and rescaling the outputs.
+        """
+
+        T = scale_factors['t']
+        S_x = np.vstack((scale_factors['x'],
+                        scale_factors['y'],
+                        scale_factors['z'],
+                        scale_factors['vx'],
+                        scale_factors['vy'],
+                        scale_factors['vz'],
+                        scale_factors['m']))
+        S_u = np.vstack((scale_factors['ux'],
+                        scale_factors['uy'],
+                        scale_factors['uz'],
+                        scale_factors['gamma']))
+
+        x_offsets = np.vstack((offsets['x'],
+                            offsets['y'],
+                            offsets['z'],
+                            offsets['vx'],
+                            offsets['vy'],
+                            offsets['vz'],
+                            offsets['m']))
+        u_offsets = np.vstack((offsets['ux'],
+                            offsets['uy'],
+                            offsets['uz'],
+                            offsets['gamma']))
+
+        x_scaled = state_scaled
+        u_scaled = control_scaled
+
+        return (T / S_x) * self.dynamics_ca(S_x*x_scaled + x_offsets, S_u*u_scaled + u_offsets, planet_params, rocket_params)
+
+    def dynamics_ca(self, state, control, planet_params: dict, rocket_params: dict):
+        """CasADi dynamics for trajectory optimization."""
+
+        drdt, dvdt, dmdt = self.dynamics(state, control, planet_params, rocket_params, ca)
+        return ca.vertcat(drdt, dvdt, dmdt)
+
+    def dynamics_np(self, state: np.ndarray, control: np.ndarray, planet_params: dict, rocket_params: dict):
+        """NumPy dynamics for numerical integration."""
+
+        drdt, dvdt, dmdt = self.dynamics(state, control, planet_params, rocket_params, np)
+        return np.concatenate([drdt, dvdt, [dmdt]])
+
+    def dynamics(self, state, control, planet_params: dict, rocket_params: dict, lib):
+        """
+        Single dynamics implementation, where lib is either NumPy or CasADi.
+        state = [x, y, z, vx, vy, vz, m]
+        control = [ux, uy, uz] or [ux, uy, uz, gamma]
+        returns derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt, dvz/dt, dm/dt]
+        """
+
+        r = state[State.X:State.Z+1]
+        v = state[State.VX:State.VZ+1]
+        m = state[State.M]
+        u = control[Control.X:Control.Z+1]
+
+        G = planet_params['G']
+        M = planet_params['M']
+        R = planet_params['R']
+        rho0 = planet_params['rho0']
+        H = planet_params['H']
+        Isp = rocket_params['Isp']
+        g0 = rocket_params['g0']
+        Aref = rocket_params['Aref']
+        Cd = rocket_params['Cd']
+
+        eps = 1.0e-8
+        r_mag = lib.sqrt(r[0]**2 + r[1]**2 + r[2]**2)
+        v_mag = lib.sqrt(v[0]**2 + v[1]**2 + v[2]**2 + eps)
+        rho = rho0 * lib.exp(-(r_mag - R) / H)
+        D = -0.5 * rho * Cd * Aref * v_mag * v
+
+        # Optimization uses a 4D control vector where  4th component is a slack variable for the
+        # thrust magnitude to allow for convex relaxation.
+        if control.shape[0] > 3:
+            u_mag = control[Control.GAMMA]
+        # Numerical integration uses a 3D control vector where the components directly specify the
+        # thrust vector, so we compute the magnitude here.
+        else:
+            u_mag = lib.sqrt(u[0]**2 + u[1]**2 + u[2]**2 + eps)
+
+        drdt = v
+        dvdt = -G * M * (r / r_mag**3) + u / m + D / m
+        dmdt = -u_mag / (Isp * g0)
+
+        return drdt, dvdt, dmdt
 
     def _create_scaled_optimization_variables(self):
         # Scaled state variables = [x, y, z, vx, vy, vz, m]
@@ -322,13 +288,6 @@ class HermiteSimpsonPoweredDescentGuidance:
         self.opti.subject_to(self.opti.bounded(Xf_scaled[State.X:State.Z+1] - pos_tol, X_scaled[State.X:State.Z+1, -1], Xf_scaled[State.X:State.Z+1] + pos_tol))
         self.opti.subject_to(self.opti.bounded(Xf_scaled[State.VX:State.VZ+1] - vel_tol, X_scaled[State.VX:State.VZ+1, -1], Xf_scaled[State.VX:State.VZ+1] + vel_tol))
 
-        # self.opti.subject_to(self.opti.bounded(Xf_scaled[State.X] - pos_tol, X_scaled[State.X, -1], Xf_scaled[State.X] + pos_tol))
-        # self.opti.subject_to(self.opti.bounded(Xf_scaled[State.Y] - pos_tol, X_scaled[State.Y, -1], Xf_scaled[State.Y] + pos_tol))
-        # self.opti.subject_to(self.opti.bounded(Xf_scaled[State.Z] - pos_tol, X_scaled[State.Z, -1], Xf_scaled[State.Z] + pos_tol))
-        # self.opti.subject_to(self.opti.bounded(Xf_scaled[State.VX] - vel_tol, X_scaled[State.VX, -1], Xf_scaled[State.VX] + vel_tol))
-        # self.opti.subject_to(self.opti.bounded(Xf_scaled[State.VY] - vel_tol, X_scaled[State.VY, -1], Xf_scaled[State.VY] + vel_tol))
-        # self.opti.subject_to(self.opti.bounded(Xf_scaled[State.VZ] - vel_tol, X_scaled[State.VZ, -1], Xf_scaled[State.VZ] + vel_tol))
-
         # Time constraint
         tf_scaled = self.opt_vars_scaled['tf']
         self.opti.subject_to(self.opti.bounded(self.bounds_scaled['t_min'], tf_scaled, self.bounds_scaled['t_max']))
@@ -368,6 +327,8 @@ class HermiteSimpsonPoweredDescentGuidance:
         Add dynamic constraints using Hermite-Simpson collocation.
         """
 
+        dynamics_scaled_fn = self._build_scaled_dynamics_function()
+
         # Time step
         # NOTE: Is there a better way we can incorporate a free final time? "tdot = 1" or "time scaling"?
         tf_scaled = self.opt_vars_scaled['tf']
@@ -380,8 +341,8 @@ class HermiteSimpsonPoweredDescentGuidance:
             uk_next = self.opt_vars_scaled['U'][:, k+1]
 
             # Dynamics at beginning and end of interval
-            fk = dynamics_scaled(xk, uk, self.planet_params, self.rocket_params, self.bounds, self.scale_factors, self.offsets)
-            fk_next = dynamics_scaled(xk_next, uk_next, self.planet_params, self.rocket_params, self.bounds, self.scale_factors, self.offsets)
+            fk = dynamics_scaled_fn(xk, uk)
+            fk_next = dynamics_scaled_fn(xk_next, uk_next)
 
             # Midpoint state (Hermite interpolation)
             xk_mid = 0.5 * (xk + xk_next) + (dt_scaled/8.0) * (fk - fk_next)
@@ -390,10 +351,24 @@ class HermiteSimpsonPoweredDescentGuidance:
             uk_mid = 0.5 * (uk + uk_next)
 
             # Dynamics at midpoint
-            fk_mid = dynamics_scaled(xk_mid, uk_mid, self.planet_params, self.rocket_params, self.bounds, self.scale_factors, self.offsets)
+            fk_mid = dynamics_scaled_fn(xk_mid, uk_mid)
 
             # Simpson integration
             self.opti.subject_to(xk_next == xk + (dt_scaled/6.0) * (fk + 4.0*fk_mid + fk_next))
+
+    def _build_scaled_dynamics_function(self):
+        """
+        Compile dynamics_scaled into a ca.Function once.
+        CasADi then treats each call as a single node in the expression graph
+        """
+
+        x_scaled_sym = ca.MX.sym('x', self.num_states)
+        u_scaled_sym = ca.MX.sym('u', self.num_controls)
+
+        xdot_scaled = self.state_dynamics_func(x_scaled_sym, u_scaled_sym, self.planet_params, self.rocket_params, self.bounds, self.scale_factors, self.offsets)
+
+        dynamics_scaled_fn = ca.Function('f', [x_scaled_sym, u_scaled_sym], [xdot_scaled])
+        return dynamics_scaled_fn
 
     def _compute_initial_solution_guess(self):
         X_scaled = self.opt_vars_scaled['X']
@@ -402,7 +377,7 @@ class HermiteSimpsonPoweredDescentGuidance:
         slack_surface = self.opt_vars_scaled['slack_surface']
 
         # Using ZEM/ZEV guidance law to generate an initial guess trajectory for the constrained trajectory optimization
-        zem_zev_pdg = ZEMZEVPoweredDescentGuidance(self.planet_params, self.rocket_params, dynamics_np)
+        zem_zev_pdg = ZEMZEVPoweredDescentGuidance(self.planet_params, self.rocket_params, self.dynamics_np)
         k = 1 # Factor to increase number of integration steps for final trajectory once optimal time of flight is found in line search
         N_final = k*self.N # Number of integration steps for final trajectory validation and plotting
         N_pred = 10 # Number of integration steps for ZEM/ZEV prediction
@@ -606,7 +581,7 @@ def main():
     }
 
     N = 50 # Number of control intervals
-    num_runs = 1 # Number of randomized runs to perform
+    num_runs = 100 # Number of randomized runs to perform
 
     results = []
     failed_initial_conditions = []
@@ -614,6 +589,7 @@ def main():
     np.random.seed(8)
     for i in range(num_runs):
         print(f"--- Starting run {i+1}/{num_runs} ---")
+
         # Randomized initial conditions
         initial_conditions = np.zeros(7)
         initial_conditions[State.X] = np.random.uniform(-50000.0, 50000.0) # m
@@ -658,7 +634,7 @@ def main():
 
         print(f"Initial conditions (run {i+1}): {initial_conditions}")
 
-        hermite_simpson_pdg = HermiteSimpsonPoweredDescentGuidance(planet_params, rocket_params, dynamics_scaled)
+        hermite_simpson_pdg = HermiteSimpsonPoweredDescentGuidance(planet_params, rocket_params)
         result = hermite_simpson_pdg.generate_trajectory(initial_conditions, terminal_conditions, bounds, landing_tolerances, scale_factors, offsets, N)
         results.append(result)
         if not result['success']:
@@ -683,8 +659,8 @@ def main():
 
     if (num_runs == 1 and num_success == 1):
         traj_plot.plot_single_run(successful_runs[0], N, planet_params['R'])
-        # comparison = traj_val.compare_optimized_vs_simulated_trajectories(dynamics_np, initial_conditions_dict, successful_runs[0], planet_params, rocket_params, N)
-        # traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N)
+        comparison = traj_val.compare_reference_vs_simulated_trajectories(hermite_simpson_pdg.dynamics_np, initial_conditions, successful_runs[0], planet_params, rocket_params, N)
+        traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N)
         traj_plot.animate_trajectory(successful_runs[0], N, planet_params['R'], thrust_scale=0.005, interval=1, mode='rocket')
     elif (num_runs > 1 and num_success > 0):
         traj_plot.plot_multiple_runs(successful_runs)

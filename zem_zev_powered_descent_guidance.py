@@ -6,7 +6,6 @@ from time import time
 
 import trajectory_plotting as traj_plot
 import trajectory_validation as traj_val
-
 from common import State, Control
 
 class ZEMZEVPoweredDescentGuidance:
@@ -22,7 +21,50 @@ class ZEMZEVPoweredDescentGuidance:
 
         self.planet_params = planet_params
         self.rocket_params = rocket_params
-        self.state_dynamics_func = state_dynamics_func
+
+        if state_dynamics_func is None:
+            print("Using dynamics function internal to class.")
+            self.state_dynamics_func = self.dynamics
+        else:
+            print("Using user-provided dynamics function.")
+            self.state_dynamics_func = state_dynamics_func
+
+    def dynamics(self, state, control, planet_params: dict, rocket_params: dict):
+        """
+        State dynamics implementation for a 3DOF powered descent guidance problem.
+        state = [x, y, z, vx, vy, vz, m]
+        control = [ux, uy, uz] or [ux, uy, uz, gamma]
+        returns derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt, dvz/dt, dm/dt]
+        """
+
+        r = state[State.X:State.Z+1]
+        v = state[State.VX:State.VZ+1]
+        m = state[State.M]
+        u = control[Control.X:Control.Z+1]
+
+        G = planet_params['G']
+        M = planet_params['M']
+        R = planet_params['R']
+        rho0 = planet_params['rho0']
+        H = planet_params['H']
+        Isp = rocket_params['Isp']
+        g0 = rocket_params['g0']
+        Aref = rocket_params['Aref']
+        Cd = rocket_params['Cd']
+
+        eps = 1.0e-8
+        r_mag = np.sqrt(r[0]**2 + r[1]**2 + r[2]**2)
+        v_mag = np.sqrt(v[0]**2 + v[1]**2 + v[2]**2 + eps)
+        rho = rho0 * np.exp(-(r_mag - R) / H)
+        D = -0.5 * rho * Cd * Aref * v_mag * v
+
+        u_mag = np.sqrt(u[0]**2 + u[1]**2 + u[2]**2 + eps)
+
+        drdt = v
+        dvdt = -G * M * (r / r_mag**3) + u / m + D / m
+        dmdt = -u_mag / (Isp * g0)
+
+        return np.concatenate([drdt, dvdt, [dmdt]])
 
     # TODO: ADD JIT
     def _rk4_step(self, state: np.ndarray, control: np.ndarray, dt: float) -> np.ndarray:
@@ -307,59 +349,6 @@ class ZEMZEVPoweredDescentGuidance:
             'U': best_trajectory['U'],
         }
 
-# TODO: ADD JIT
-# TODO: Share dynamics across different trajectory optimization methods
-def state_dynamics(state: np.array, control: np.array, planet_params: dict, rocket_params: dict) -> np.array:
-    """
-    Computes the time derivative of the state vector for a rocket under the influence of gravity, drag, and thrust.
-
-    Args:
-        state (np.array): Current state vector [x, y, z, vx, vy, vz, m]
-        control (np.array): Control input vector [ux, uy, uz]
-        planet_params (dict): Physical parameters
-        rocket_params (dict): Rocket parameters
-
-    Returns:
-        state_dot (np.array): Time derivative of the state vector
-    """
-    x, y, z, vx, vy, vz, m = state
-    ux, uy, uz = control
-
-    G = planet_params['G']
-    M = planet_params['M']
-    R = planet_params['R']
-    rho0 = planet_params['rho0']
-    H = planet_params['H']
-
-    Isp = rocket_params['Isp']
-    g0 = rocket_params['g0']
-    Aref = rocket_params['Aref']
-    Cd = rocket_params['Cd']
-
-    r = np.sqrt(x**2 + y**2 + z**2)
-    u_total = np.sqrt(ux**2 + uy**2 + uz**2)
-
-    r = np.sqrt(x**2 + y**2 + z**2)
-    h = r - R
-    rho = rho0 * np.exp(-h / H)
-    v = np.sqrt(vx**2 + vy**2 + vz**2)
-
-    D = -0.5 * rho * Cd * Aref * v * np.array([vx, vy, vz])
-    Dx = D[0]
-    Dy = D[1]
-    Dz = D[2]
-
-    # TODO: Neaten up the dynamics function into vectors for xdot, vdot, and mdot
-    dxdt = vx
-    dydt = vy
-    dzdt = vz
-    dvxdt = -G * M * (x / r**3) + Dx / m + ux / m
-    dvydt = -G * M * (y / r**3) + Dy / m + uy / m
-    dvzdt = -G * M * (z / r**3) + Dz / m + uz / m
-    dmdt = -u_total / (Isp * g0)
-
-    return np.array([dxdt, dydt, dzdt, dvxdt, dvydt, dvzdt, dmdt])
-
 def main():
     # TODO: Share parameters and initial conditions across different trajectory optimization methods for easier comparison
 
@@ -393,21 +382,24 @@ def main():
     terminal_conditions[State.VZ] = 0.0
     terminal_conditions[State.M] = rocket_params['mass_dry']
 
-    num_runs = 1
+    num_runs = 100
     N = 50 # Number of integration steps in generated trajectories during line search
     N_final = 10*N # Number of integration steps in final optimized trajectory
+    # NOTE: The choice of N_pred can have a significant impact on the generated control commands (e.g., lower N_pred can cause more jitter)
     N_pred = 10 # Number of integration steps for ZEM/ZEV prediction
     t_min = 10.0 # Minimum time of flight in line search (s)
     t_max = 500.0 # Maximum time of flight in line search (s)
     t_tol = 1.0 # Optimal time of flight tolerance in line search (s)
-    r_tol = 10.0 # Position tolerance for successful trajectory (m)
-    v_tol = 10.0 # Velocity tolerance for successful trajectory (m/s)
+    r_tol = 25.0 # Position tolerance for successful trajectory (m)
+    v_tol = 25.0 # Velocity tolerance for successful trajectory (m/s)
     verbose = True
 
     results = []
     failed_initial_conditions = []
     np.random.seed(8)
     for i in range(num_runs):
+        print(f"--- Starting run {i+1}/{num_runs} ---")
+
         # Generate random initial conditions for each run
         initial_conditions = np.zeros(7)
         initial_conditions[State.X] = np.random.uniform(-50000.0, 50000.0) # m
@@ -422,7 +414,7 @@ def main():
 
         print(f"Initial conditions (run {i+1}): {initial_conditions}")
 
-        zem_zev_pdg = ZEMZEVPoweredDescentGuidance(planet_params, rocket_params, state_dynamics)
+        zem_zev_pdg = ZEMZEVPoweredDescentGuidance(planet_params, rocket_params, None)
         result = zem_zev_pdg.find_best_trajectory(initial_conditions, terminal_conditions, t_min, t_max, t_tol, r_tol, v_tol, N, N_final, N_pred, verbose)
         results.append(result)
         if not result['success']:
@@ -438,9 +430,8 @@ def main():
 
     if (num_runs == 1):
         traj_plot.plot_single_run(successful_runs[0], N_final, planet_params['R'])
-        # comparison = traj_val.compare_optimized_vs_simulated_trajectories(dynamics_np, initial_conditions, successful_runs[0], planet_params, rocket_params, N_final)
-        # traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N_final)
-        # traj_plot.animate_trajectory(successful_runs[0], N_final, planet_params['R'])
+        comparison = traj_val.compare_reference_vs_simulated_trajectories(zem_zev_pdg.state_dynamics_func, initial_conditions, successful_runs[0], planet_params, rocket_params, N_final)
+        traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N_final)
         traj_plot.animate_trajectory(successful_runs[0], N_final, planet_params['R'], thrust_scale=0.005, interval=1, mode='rocket')
     if (num_runs > 1 and num_success > 0):
         traj_plot.plot_multiple_runs(successful_runs)

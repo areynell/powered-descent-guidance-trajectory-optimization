@@ -198,8 +198,8 @@ def animate_trajectory(trajectory, N, R, thrust_scale=0.01, interval=50, num_fra
     proj_yz = ax.plot([], [], [], 'k.', markersize=10, alpha=0.3)[0]
 
     if mode == 'rocket':
-        rocket_body = ax.plot([], [], [], color='black', linewidth=8, solid_capstyle='round')[0]
         rocket_flame = ax.plot([], [], [], color='red', linewidth=3)[0]
+        rocket_body = ax.plot([], [], [], color='black', linewidth=8, solid_capstyle='round')[0]
     elif mode == 'point':
         thrust_vectors = [None]
     else:
