@@ -1,12 +1,3 @@
-# TODO:
-# 0) Plot planet's surface near landing site, and add linear surface constraint instead of radial constraint
-# 1) Add glide-slope constraint near landing site
-# 2) Use polynomial trajectories for state and controls that match collocation method
-# 3) Implement different collocation methods
-# 4) Add rotation of planet
-# 5) Re-order functions to make reading flow easier
-# 6) Add 6-DOF dynamics
-
 import numpy as np
 import casadi as ca
 from time import time
@@ -581,11 +572,12 @@ def main():
     }
 
     N = 50 # Number of control intervals
-    num_runs = 100 # Number of randomized runs to perform
+    num_runs = 1 # Number of randomized runs to perform
 
     results = []
     failed_initial_conditions = []
     t_start_total = time()
+    # np.random.seed(1)
     np.random.seed(8)
     for i in range(num_runs):
         print(f"--- Starting run {i+1}/{num_runs} ---")

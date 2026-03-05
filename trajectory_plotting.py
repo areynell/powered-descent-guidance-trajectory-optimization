@@ -62,6 +62,9 @@ def plot_single_run(trajectory, N, R):
     axes[1, 1].grid()
     axes[1, 1].legend()
 
+    # # Save the figure as a PNG file
+    # fig.savefig('media/powered_descent_trajectory_metrics.png', dpi=300)
+
     # Trajectory plot with thrust vectors
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection='3d')
@@ -141,6 +144,9 @@ def plot_multiple_runs(trajectories):
     ax.set_title(f'All {len(trajectories)} Successful Trajectories')
     ax.legend()
     plt.show()
+
+    # # Save the figure as a PNG file
+    # fig.savefig('media/powered_descent_all_trajectories.png', dpi=300)
 
 def animate_trajectory(trajectory, N, R, thrust_scale=0.01, interval=50, num_frames=300, mode='rocket'):
     """
@@ -290,6 +296,9 @@ def animate_trajectory(trajectory, N, R, thrust_scale=0.01, interval=50, num_fra
         return artists
 
     anim = FuncAnimation(fig, update, frames=num_frames, init_func=init, interval=interval, blit=False)
+
+    # # Save animation as a GIF file
+    # anim.save('media/powered_descent_rocket_landing.gif', writer='pillow', fps=15)
 
     plt.tight_layout()
     plt.show()
