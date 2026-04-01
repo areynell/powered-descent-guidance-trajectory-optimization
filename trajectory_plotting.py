@@ -73,7 +73,7 @@ def plot_single_run(trajectory, N, R):
     ax.plot([X[State.X, -1]], [X[State.Y, -1]], [X[State.Z, -1] - R], 'go', label='End')
 
     # Draw thrust vectors
-    thrust_scale = 0.01  # Scale factor for visualization
+    thrust_scale = 0.001  # Scale factor for visualization
     stride = max(1, N // 50) # Prevent drawing too many arrows
     for i in range(0, N, stride):
         # Calculate thrust magnitude
@@ -146,7 +146,7 @@ def plot_multiple_runs(trajectories):
     plt.show()
 
     # # Save the figure as a PNG file
-    # fig.savefig('media/powered_descent_all_trajectories.png', dpi=300)
+    # fig.savefig('media/powered_descent_monte_carlo_trajectories.png', dpi=300)
 
 def animate_trajectory(trajectory, N, R, thrust_scale=0.01, interval=50, num_frames=300, mode='rocket'):
     """

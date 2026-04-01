@@ -653,7 +653,7 @@ def main():
         traj_plot.plot_single_run(successful_runs[0], N, planet_params['R'])
         comparison = traj_val.compare_reference_vs_simulated_trajectories(hermite_simpson_pdg.dynamics_np, initial_conditions, successful_runs[0], planet_params, rocket_params, N)
         traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N)
-        traj_plot.animate_trajectory(successful_runs[0], N, planet_params['R'], thrust_scale=0.005, interval=1, mode='rocket')
+        traj_plot.animate_trajectory(successful_runs[0], N, planet_params['R'], thrust_scale=0.001, interval=1, mode='rocket')
     elif (num_runs > 1 and num_success > 0):
         traj_plot.plot_multiple_runs(successful_runs)
 
