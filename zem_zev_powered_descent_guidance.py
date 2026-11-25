@@ -335,8 +335,11 @@ class ZEMZEVPoweredDescentGuidance:
             print(f"Best trajectory final mass: {best_trajectory['X'][State.M, -1]:.2f} kg")
 
         success = True
-        if (pos_error > r_tol or vel_error > v_tol):
+        if not np.all(np.isfinite(best_trajectory['X'])):
+            success = False  # NaN errors compare False against the tolerances below, so catch them here
+        if pos_error > r_tol or vel_error > v_tol:
             success = False
+        if not success:
             print("WARNING: Best trajectory failed to meet terminal conditions within acceptable error thresholds. Final position error: {:.2f} m, final velocity error: {:.2f} m/s".format(pos_error, vel_error))
         # if best_trajectory['X'][State.M, -1] < terminal_conditions[State.M]:
         #     best_trajectory['success'] = False
