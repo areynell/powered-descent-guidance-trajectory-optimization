@@ -1,4 +1,4 @@
-from enum import IntEnum
+import os
 
 import numpy as np
 from scipy.optimize import minimize_scalar
@@ -393,10 +393,12 @@ def main():
     r_tol = 25.0 # Position tolerance for successful trajectory (m)
     v_tol = 25.0 # Velocity tolerance for successful trajectory (m/s)
     verbose = True
+    seed = 8 # Random seed for the initial conditions (keep fixed so saved Monte Carlo results stay comparable)
 
     results = []
+    all_initial_conditions = []
     failed_initial_conditions = []
-    np.random.seed(8)
+    np.random.seed(seed)
     for i in range(num_runs):
         print(f"--- Starting run {i+1}/{num_runs} ---")
 
@@ -417,6 +419,7 @@ def main():
         zem_zev_pdg = ZEMZEVPoweredDescentGuidance(planet_params, rocket_params, None)
         result = zem_zev_pdg.find_best_trajectory(initial_conditions, terminal_conditions, t_min, t_max, t_tol, r_tol, v_tol, N, N_final, N_pred, verbose)
         results.append(result)
+        all_initial_conditions.append(initial_conditions)
         if not result['success']:
             failed_initial_conditions.append(initial_conditions)
 
@@ -427,6 +430,16 @@ def main():
         print("\n--- Failed Initial Conditions ---")
         for initial_condition in failed_initial_conditions:
             print(initial_condition)
+
+    # Save Monte Carlo results before plotting (plt.show() blocks), so they can be diffed against after code changes
+    if (num_runs > 1):
+        results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'monte_carlo_results', 'zem_zev.json')
+        settings = {
+            'num_runs': num_runs, 'seed': seed, 'N': N, 'N_final': N_final, 'N_pred': N_pred,
+            't_min': t_min, 't_max': t_max, 't_tol': t_tol, 'r_tol': r_tol, 'v_tol': v_tol,
+        }
+        traj_val.save_monte_carlo_results(results_path, results, all_initial_conditions, settings)
+        print(f"\nSaved Monte Carlo results to {results_path}")
 
     if (num_runs == 1):
         traj_plot.plot_single_run(successful_runs[0], N_final, planet_params['R'])

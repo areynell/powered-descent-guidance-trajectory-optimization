@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import casadi as ca
 from time import time
@@ -572,13 +574,14 @@ def main():
     }
 
     N = 50 # Number of control intervals
-    num_runs = 1 # Number of randomized runs to perform
+    num_runs = 100 # Number of randomized runs to perform
+    seed = 8 # Random seed for the initial conditions (keep fixed so saved Monte Carlo results stay comparable)
 
     results = []
+    all_initial_conditions = []
     failed_initial_conditions = []
     t_start_total = time()
-    # np.random.seed(1)
-    np.random.seed(8)
+    np.random.seed(seed)
     for i in range(num_runs):
         print(f"--- Starting run {i+1}/{num_runs} ---")
 
@@ -629,6 +632,7 @@ def main():
         hermite_simpson_pdg = HermiteSimpsonPoweredDescentGuidance(planet_params, rocket_params)
         result = hermite_simpson_pdg.generate_trajectory(initial_conditions, terminal_conditions, bounds, landing_tolerances, scale_factors, offsets, N)
         results.append(result)
+        all_initial_conditions.append(initial_conditions)
         if not result['success']:
             failed_initial_conditions.append(initial_conditions)
 
@@ -648,6 +652,13 @@ def main():
         print("\n--- Failed Initial Conditions ---")
         for initial_condition in failed_initial_conditions:
             print(initial_condition)
+
+    # Save Monte Carlo results before plotting (plt.show() blocks), so they can be diffed against after code changes
+    if (num_runs > 1):
+        results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'monte_carlo_results', 'hermite_simpson.json')
+        settings = {'num_runs': num_runs, 'seed': seed, 'N': N, 'bounds': bounds, 'landing_tolerances': landing_tolerances}
+        traj_val.save_monte_carlo_results(results_path, results, all_initial_conditions, settings)
+        print(f"\nSaved Monte Carlo results to {results_path}")
 
     if (num_runs == 1 and num_success == 1):
         traj_plot.plot_single_run(successful_runs[0], N, planet_params['R'])
