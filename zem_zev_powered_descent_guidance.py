@@ -1,4 +1,5 @@
 import os
+from functools import partial
 
 import numpy as np
 from scipy.optimize import minimize_scalar
@@ -7,6 +8,7 @@ from time import time
 import trajectory_plotting as traj_plot
 import trajectory_validation as traj_val
 from common import State, Control
+import monte_carlo
 
 class ZEMZEVPoweredDescentGuidance:
     def __init__(self, planet_params: dict, rocket_params: dict, state_dynamics_func: callable):
@@ -349,6 +351,13 @@ class ZEMZEVPoweredDescentGuidance:
             'U': best_trajectory['U'],
         }
 
+def _run_single_trajectory(initial_conditions, planet_params, rocket_params, terminal_conditions, t_min, t_max, t_tol, r_tol, v_tol, N, N_final, N_pred, verbose):
+    """
+    Runs a single trajectory, to be used in parallel processing. Module-level so it can be pickled and sent to worker processes.
+    """
+    zem_zev_pdg = ZEMZEVPoweredDescentGuidance(planet_params, rocket_params, None)
+    return zem_zev_pdg.find_best_trajectory(initial_conditions, terminal_conditions, t_min, t_max, t_tol, r_tol, v_tol, N, N_final, N_pred, verbose)
+
 def main():
     # TODO: Share parameters and initial conditions across different trajectory optimization methods for easier comparison
 
@@ -383,6 +392,7 @@ def main():
     terminal_conditions[State.M] = rocket_params['mass_dry']
 
     num_runs = 100
+    num_workers = os.cpu_count() # Number of parallel worker processes (1 = serial with full verbose output)
     N = 50 # Number of integration steps in generated trajectories during line search
     N_final = 10*N # Number of integration steps in final optimized trajectory
     # NOTE: The choice of N_pred can have a significant impact on the generated control commands (e.g., lower N_pred can cause more jitter)
@@ -395,41 +405,19 @@ def main():
     verbose = True
     seed = 8 # Random seed for the initial conditions (keep fixed so saved Monte Carlo results stay comparable)
 
-    results = []
-    all_initial_conditions = []
-    failed_initial_conditions = []
-    np.random.seed(seed)
-    for i in range(num_runs):
-        print(f"--- Starting run {i+1}/{num_runs} ---")
+    all_initial_conditions = monte_carlo.sample_initial_conditions(num_runs, seed, planet_params, rocket_params)
 
-        # Generate random initial conditions for each run
-        initial_conditions = np.zeros(7)
-        initial_conditions[State.X] = np.random.uniform(-50000.0, 50000.0) # m
-        initial_conditions[State.Y] = np.random.uniform(-50000.0, 50000.0) # m
-        initial_conditions[State.Z] = planet_params['R'] + np.random.uniform(50000.0, 150000.0) # m
-        initial_conditions[State.VX] = np.random.uniform(-1000.0, 1000.0) # m/s
-        initial_conditions[State.VY] = np.random.uniform(-1000.0, 1000.0) # m/s
-        initial_conditions[State.VZ] = np.random.uniform(-500.0, 500.0) # m/s
-        initial_conditions[State.M] = rocket_params['mass_start'] # kg
+    run_func = partial(_run_single_trajectory, planet_params=planet_params, rocket_params=rocket_params, terminal_conditions=terminal_conditions,
+                       t_min=t_min, t_max=t_max, t_tol=t_tol, r_tol=r_tol, v_tol=v_tol, N=N, N_final=N_final, N_pred=N_pred, verbose=verbose)
 
-        # initial_conditions = {'x0': 48045.32429793403, 'y0': 38719.85545747625, 'z0': 6480179.72465158, 'vx0': 951.9382652644483, 'vy0': 968.2924888876025, 'vz0': -271.9402464272812, 'm0': 75000.0}
+    t_start_total = time()
+    results = monte_carlo.run_monte_carlo(run_func, all_initial_conditions, num_workers)
+    t_end_total = time()
 
-        print(f"Initial conditions (run {i+1}): {initial_conditions}")
+    print(f"\nFinished {num_runs} runs in {t_end_total - t_start_total:.2f} seconds.")
 
-        zem_zev_pdg = ZEMZEVPoweredDescentGuidance(planet_params, rocket_params, None)
-        result = zem_zev_pdg.find_best_trajectory(initial_conditions, terminal_conditions, t_min, t_max, t_tol, r_tol, v_tol, N, N_final, N_pred, verbose)
-        results.append(result)
-        all_initial_conditions.append(initial_conditions)
-        if not result['success']:
-            failed_initial_conditions.append(initial_conditions)
-
-    successful_runs = [r for r in results if r["success"]]
+    successful_runs = monte_carlo.print_summary(results, all_initial_conditions)
     num_success = len(successful_runs)
-
-    if failed_initial_conditions:
-        print("\n--- Failed Initial Conditions ---")
-        for initial_condition in failed_initial_conditions:
-            print(initial_condition)
 
     # Save Monte Carlo results before plotting (plt.show() blocks), so they can be diffed against after code changes
     if (num_runs > 1):
@@ -438,12 +426,14 @@ def main():
             'num_runs': num_runs, 'seed': seed, 'N': N, 'N_final': N_final, 'N_pred': N_pred,
             't_min': t_min, 't_max': t_max, 't_tol': t_tol, 'r_tol': r_tol, 'v_tol': v_tol,
         }
-        traj_val.save_monte_carlo_results(results_path, results, all_initial_conditions, settings)
+        monte_carlo.save_monte_carlo_results(results_path, results, all_initial_conditions, settings)
         print(f"\nSaved Monte Carlo results to {results_path}")
 
-    if (num_runs == 1):
+    if (num_runs == 1 and num_success == 1):
         traj_plot.plot_single_run(successful_runs[0], N_final, planet_params['R'])
-        comparison = traj_val.compare_reference_vs_simulated_trajectories(zem_zev_pdg.state_dynamics_func, initial_conditions, successful_runs[0], planet_params, rocket_params, N_final)
+        # TODO: Improve how the dynamics function is passed to the comparison function
+        dynamics_func = ZEMZEVPoweredDescentGuidance(planet_params, rocket_params, None).state_dynamics_func
+        comparison = traj_val.compare_reference_vs_simulated_trajectories(dynamics_func, all_initial_conditions[0], successful_runs[0], planet_params, rocket_params, N_final)
         traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N_final)
         traj_plot.animate_trajectory(successful_runs[0], N_final, planet_params['R'], thrust_scale=0.005, interval=1, mode='rocket')
     if (num_runs > 1 and num_success > 0):

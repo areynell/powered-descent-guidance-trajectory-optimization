@@ -1,5 +1,12 @@
 import os
 
+# Limit OpenBLAS to one thread. Must be set before numpy/casadi load their OpenBLAS copies.
+# This is important for parallel Monte Carlo runs, otherwise each worker process will spawn
+# multiple threads and oversubscribe the CPU.
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+
+from functools import partial
+
 import numpy as np
 import casadi as ca
 from time import time
@@ -8,6 +15,7 @@ import trajectory_validation as traj_val
 import trajectory_plotting as traj_plot
 from zem_zev_powered_descent_guidance import ZEMZEVPoweredDescentGuidance
 from common import State, Control
+import monte_carlo
 
 class HermiteSimpsonPoweredDescentGuidance:
     def __init__(self, planet_params: dict, rocket_params: dict):
@@ -526,6 +534,13 @@ class HermiteSimpsonPoweredDescentGuidance:
             print(f"--- Run failed: {e} ---")
             return {"success": False}
 
+def _run_single_trajectory(initial_conditions, planet_params, rocket_params, terminal_conditions, bounds, landing_tolerances, scale_factors, offsets, N):
+    """
+    Runs a single trajectory, to be used in parallel processing. Module-level so it can be pickled and sent to worker processes.
+    """
+    hermite_simpson_pdg = HermiteSimpsonPoweredDescentGuidance(planet_params, rocket_params)
+    return hermite_simpson_pdg.generate_trajectory(initial_conditions, terminal_conditions, bounds, landing_tolerances, scale_factors, offsets, N)
+
 def main():
     # Planet parameters
     planet_params = {
@@ -575,94 +590,67 @@ def main():
 
     N = 50 # Number of control intervals
     num_runs = 100 # Number of randomized runs to perform
+    num_workers = os.cpu_count() # Number of parallel worker processes (1 = serial with full verbose output)
     seed = 8 # Random seed for the initial conditions (keep fixed so saved Monte Carlo results stay comparable)
 
-    results = []
-    all_initial_conditions = []
-    failed_initial_conditions = []
+    # Scaling factors for non-dimensionalization
+    scale_factors = {
+        'x': planet_params['R'],
+        'y': planet_params['R'],
+        'z': planet_params['R'],
+        'vx': 1000.0,
+        'vy': 1000.0,
+        'vz': 1000.0,
+        'm': rocket_params['mass_start'],
+        'ux': rocket_params['thrust_max'],
+        'uy': rocket_params['thrust_max'],
+        'uz': rocket_params['thrust_max'],
+        'gamma': rocket_params['thrust_max'],
+        't': bounds['t_max']
+    }
+
+    # Offsets for non-dimensionalization
+    offsets = {
+        'x': 0.0,
+        'y': 0.0,
+        'z': 0.0,
+        'vx': 0.0,
+        'vy': 0.0,
+        'vz': 0.0,
+        'm': 0.0,
+        'ux': 0.0,
+        'uy': 0.0,
+        'uz': 0.0,
+        'gamma': 0.0,
+        't': 0.0
+    }
+
+    all_initial_conditions = monte_carlo.sample_initial_conditions(num_runs, seed, planet_params, rocket_params)
+
+    # Run Monte Carlo trajectory optimizations in parallel using multiprocessing
+    run_func = partial(_run_single_trajectory, planet_params=planet_params, rocket_params=rocket_params, terminal_conditions=terminal_conditions,
+                       bounds=bounds, landing_tolerances=landing_tolerances, scale_factors=scale_factors, offsets=offsets, N=N)
     t_start_total = time()
-    np.random.seed(seed)
-    for i in range(num_runs):
-        print(f"--- Starting run {i+1}/{num_runs} ---")
-
-        # Randomized initial conditions
-        initial_conditions = np.zeros(7)
-        initial_conditions[State.X] = np.random.uniform(-50000.0, 50000.0) # m
-        initial_conditions[State.Y] = np.random.uniform(-50000.0, 50000.0) # m
-        initial_conditions[State.Z] = planet_params['R'] + np.random.uniform(50000.0, 150000.0) # m
-        initial_conditions[State.VX] = np.random.uniform(-1000.0, 1000.0) # m/s
-        initial_conditions[State.VY] = np.random.uniform(-1000.0, 1000.0) # m/s
-        initial_conditions[State.VZ] = np.random.uniform(-500.0, 500.0) # m/s
-        initial_conditions[State.M] = rocket_params['mass_start'] # kg - Landing mass (Dry mass + reserve)
-
-        # Scaling factors for non-dimensionalization
-        scale_factors = {
-            'x': planet_params['R'],
-            'y': planet_params['R'],
-            'z': planet_params['R'],
-            'vx': 1000.0,
-            'vy': 1000.0,
-            'vz': 1000.0,
-            'm': rocket_params['mass_start'],
-            'ux': rocket_params['thrust_max'],
-            'uy': rocket_params['thrust_max'],
-            'uz': rocket_params['thrust_max'],
-            'gamma': rocket_params['thrust_max'],
-            't': bounds['t_max']
-        }
-
-        # Offsets for non-dimensionalization
-        offsets = {
-            'x': 0.0,
-            'y': 0.0,
-            'z': 0.0,
-            'vx': 0.0,
-            'vy': 0.0,
-            'vz': 0.0,
-            'm': 0.0,
-            'ux': 0.0,
-            'uy': 0.0,
-            'uz': 0.0,
-            'gamma': 0.0,
-            't': 0.0
-        }
-
-        print(f"Initial conditions (run {i+1}): {initial_conditions}")
-
-        hermite_simpson_pdg = HermiteSimpsonPoweredDescentGuidance(planet_params, rocket_params)
-        result = hermite_simpson_pdg.generate_trajectory(initial_conditions, terminal_conditions, bounds, landing_tolerances, scale_factors, offsets, N)
-        results.append(result)
-        all_initial_conditions.append(initial_conditions)
-        if not result['success']:
-            failed_initial_conditions.append(initial_conditions)
-
+    results = monte_carlo.run_monte_carlo(run_func, all_initial_conditions, num_workers)
     t_end_total = time()
 
     print(f"\nFinished {num_runs} runs in {t_end_total - t_start_total:.2f} seconds.")
 
-    #  Summarize Results
-    successful_runs = [r for r in results if r["success"]]
+    successful_runs = monte_carlo.print_summary(results, all_initial_conditions)
     num_success = len(successful_runs)
-
-    print("\n--- Overall Summary ---")
-    print(f"Total runs attempted: {num_runs}")
-    print(f"Successful runs: {num_success} ({num_success/num_runs*100:.1f}%)")
-
-    if failed_initial_conditions:
-        print("\n--- Failed Initial Conditions ---")
-        for initial_condition in failed_initial_conditions:
-            print(initial_condition)
 
     # Save Monte Carlo results before plotting (plt.show() blocks), so they can be diffed against after code changes
     if (num_runs > 1):
         results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'monte_carlo_results', 'hermite_simpson.json')
         settings = {'num_runs': num_runs, 'seed': seed, 'N': N, 'bounds': bounds, 'landing_tolerances': landing_tolerances}
-        traj_val.save_monte_carlo_results(results_path, results, all_initial_conditions, settings)
+        monte_carlo.save_monte_carlo_results(results_path, results, all_initial_conditions, settings)
         print(f"\nSaved Monte Carlo results to {results_path}")
 
     if (num_runs == 1 and num_success == 1):
         traj_plot.plot_single_run(successful_runs[0], N, planet_params['R'])
-        comparison = traj_val.compare_reference_vs_simulated_trajectories(hermite_simpson_pdg.dynamics_np, initial_conditions, successful_runs[0], planet_params, rocket_params, N)
+        # TODO: Improve how the dynamics function is passed to the comparison function
+        dynamics_func = HermiteSimpsonPoweredDescentGuidance(planet_params, rocket_params).dynamics_np
+        comparison = traj_val.compare_reference_vs_simulated_trajectories(dynamics_func, all_initial_conditions[0], successful_runs[0], planet_params, rocket_params, N)
         traj_val.plot_trajectory_comparison(successful_runs[0], comparison, N)
         traj_plot.animate_trajectory(successful_runs[0], N, planet_params['R'], thrust_scale=0.001, interval=1, mode='rocket')
     elif (num_runs > 1 and num_success > 0):
