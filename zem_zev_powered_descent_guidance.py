@@ -303,8 +303,14 @@ class ZEMZEVPoweredDescentGuidance:
             result (dict): Dictionary containing optimization results and best trajectory data
         """
 
+        # Cost for trajectories that blow up to inf/NaN. It is finite, because a NaN cost breaks the line search's
+        # comparisons, and far above any real trajectory's cost, so the search moves away from those times of flight.
+        divergence_cost = 1.0e3 * initial_conditions[State.M]
+
         def trajectory_cost(t_final: float) -> float:
             trajectory = self._generate_trajectory(initial_conditions, terminal_conditions, t_final, N, N_pred, verbose)
+            if not np.all(np.isfinite(trajectory['X'])):
+                return divergence_cost
             cost = -trajectory['X'][State.M, -1]  # Final mass is the last element in the state vector, negate for minimization
             return cost  # Minimize negative final mass (maximize final mass)
 
