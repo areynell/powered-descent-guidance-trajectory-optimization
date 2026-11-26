@@ -57,7 +57,12 @@ class ZEMZEVPoweredDescentGuidance:
         eps = 1.0e-8
         r_mag = np.sqrt(r[0]**2 + r[1]**2 + r[2]**2)
         v_mag = np.sqrt(v[0]**2 + v[1]**2 + v[2]**2 + eps)
-        rho = rho0 * np.exp(-(r_mag - R) / H)
+        # Below the surface, use sea-level density. Otherwise the zero-thrust predictions, which coast far underground,
+        # see runaway drag and the fixed-step RK4 blows up to inf/NaN
+        altitude = r_mag - R
+        if altitude < 0.0:
+            altitude = 0.0
+        rho = rho0 * np.exp(-altitude / H)
         D = -0.5 * rho * Cd * Aref * v_mag * v
 
         u_mag = np.sqrt(u[0]**2 + u[1]**2 + u[2]**2 + eps)

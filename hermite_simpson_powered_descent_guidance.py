@@ -143,7 +143,13 @@ class HermiteSimpsonPoweredDescentGuidance:
         eps = 1.0e-8
         r_mag = lib.sqrt(r[0]**2 + r[1]**2 + r[2]**2)
         v_mag = lib.sqrt(v[0]**2 + v[1]**2 + v[2]**2 + eps)
-        rho = rho0 * lib.exp(-(r_mag - R) / H)
+        # Below the surface, use sea-level density (NumPy path only, matching the ZEM/ZEV dynamics, since this path
+        # generates the ZEM/ZEV warm start). The CasADi path stays smooth, because a clamp would put a kink in the
+        # derivatives right at the landing point (altitude 0).
+        altitude = r_mag - R
+        if lib is np and altitude < 0.0:
+            altitude = 0.0
+        rho = rho0 * lib.exp(-altitude / H)
         D = -0.5 * rho * Cd * Aref * v_mag * v
 
         # Optimization uses a 4D control vector where  4th component is a slack variable for the
