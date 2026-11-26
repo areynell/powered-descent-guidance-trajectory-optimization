@@ -190,6 +190,12 @@ class ZEMZEVPoweredDescentGuidance:
         else:
             return a_cmd
 
+    def _min_trajectory_altitude(self, X: np.ndarray) -> float:
+        """Lowest altitude (m) reached along a trajectory's states; negative means below the surface."""
+
+        r_mag_traj = np.sqrt(X[State.X, :]**2 + X[State.Y, :]**2 + X[State.Z, :]**2)
+        return np.min(r_mag_traj) - self.planet_params['R']
+
     # TODO: ADD JIT
     def _generate_trajectory(self, initial_conditions: np.ndarray, terminal_conditions: np.ndarray, t_final: float, N: int, N_pred: int, verbose: bool = False) -> dict:
         """
@@ -340,9 +346,11 @@ class ZEMZEVPoweredDescentGuidance:
         target_vf = np.array([terminal_conditions[State.VX], terminal_conditions[State.VY], terminal_conditions[State.VZ]])
         pos_error = np.linalg.norm(best_rf - target_rf)
         vel_error = np.linalg.norm(best_vf - target_vf)
+        min_altitude = self._min_trajectory_altitude(best_trajectory['X'])
         if verbose:
             print(f"Best trajectory final position error: {pos_error:.2f} m")
             print(f"Best trajectory final velocity error: {vel_error:.2f} m/s")
+            print(f"Best trajectory minimum altitude: {min_altitude:.2f} m")
             print(f"Best trajectory final mass: {best_trajectory['X'][State.M, -1]:.2f} kg")
 
         success = True
@@ -350,8 +358,11 @@ class ZEMZEVPoweredDescentGuidance:
             success = False  # NaN errors compare False against the tolerances below, so catch them here
         if pos_error > r_tol or vel_error > v_tol:
             success = False
+        # The landing may end up to r_tol from the target, so the path gets the same margin below the surface
+        if min_altitude < -r_tol:
+            success = False
         if not success:
-            print("WARNING: Best trajectory failed to meet terminal conditions within acceptable error thresholds. Final position error: {:.2f} m, final velocity error: {:.2f} m/s".format(pos_error, vel_error))
+            print("WARNING: Best trajectory failed to meet terminal conditions or stay above the surface within acceptable error thresholds. Final position error: {:.2f} m, final velocity error: {:.2f} m/s, minimum altitude: {:.2f} m".format(pos_error, vel_error, min_altitude))
         # if best_trajectory['X'][State.M, -1] < terminal_conditions[State.M]:
         #     best_trajectory['success'] = False
         #     print("WARNING: Best trajectory failed to meet minimum final mass requirement. Final mass: {:.2f} kg, minimum required mass: {:.2f} kg".format(best_trajectory['X'][State.M, -1], terminal_conditions[State.M]))
