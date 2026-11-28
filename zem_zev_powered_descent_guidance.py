@@ -13,7 +13,7 @@ import monte_carlo
 class ZEMZEVPoweredDescentGuidance:
     def __init__(self, planet_params: dict, rocket_params: dict, state_dynamics_func: callable):
         """
-        Initializes the ZEM/ZEV trajectory generator. For more information, see the paper titled "Applications of Generalized Zero-Effort-Miss/Zero-Effort-Velocity Feedback Guidance Algorithm" by Guo, Hawkins and Wie.
+        Initializes a Zero-Effort-Miss/Zero-Effort-Velocity trajectory generator. For more information, see the paper titled "Applications of Generalized Zero-Effort-Miss/Zero-Effort-Velocity Feedback Guidance Algorithm" by Guo, Hawkins and Wie.
 
         Args:
             planet_params (dict): Dictionary containing planetary parameters (e.g., gravity, atmosphere)
@@ -147,7 +147,7 @@ class ZEMZEVPoweredDescentGuidance:
         zem = r_target - r_pred
         zev = v_target - v_pred
 
-        # Apply control law
+        # Apply guidance law
         Kp = 6.0 / t_go**2
         Kv = 2.0 / t_go
         a_cmd = Kp * zem - Kv * zev
@@ -213,35 +213,19 @@ class ZEMZEVPoweredDescentGuidance:
             trajectory (dict): Dictionary containing trajectory data for plotting and analysis
         """
 
-        # Storage
-        r_hist = []
-        v_hist = []
-        m_hist = []
-        u_hist = []
-        t_hist = []
+        # Storage: U_hist[:, k] is the control applied from node k to node k+1
+        num_states = initial_conditions.shape[0]
+        X_hist = np.zeros((num_states, N+1))
+        U_hist = np.zeros((3, N+1))
+        t_hist = np.zeros(N+1)
 
         # Initial State
-        r = np.array([initial_conditions[State.X], initial_conditions[State.Y], initial_conditions[State.Z]])
-        v = np.array([initial_conditions[State.VX], initial_conditions[State.VY], initial_conditions[State.VZ]])
-        m = initial_conditions[State.M]
+        X_hist[:, 0] = initial_conditions
         t = 0.0
 
         # Target State
         r_target = np.array([terminal_conditions[State.X], terminal_conditions[State.Y], terminal_conditions[State.Z]])
         v_target = np.array([terminal_conditions[State.VX], terminal_conditions[State.VY], terminal_conditions[State.VZ]])
-
-        # Compute/store node 0 (t=0)
-        t_go = t_final - t
-        states = np.concatenate((r, v, [m]))
-        a_cmd = self._compute_accel_command(states, r_target, v_target, t_go, N_pred)
-        a_cmd = self._saturate_accel_command(a_cmd, m)
-        u = m * a_cmd
-
-        r_hist.append(r.copy())
-        v_hist.append(v.copy())
-        m_hist.append(m)
-        u_hist.append(u.copy())
-        t_hist.append(t)
 
         # Integration time step (s)
         dt = t_final / N
@@ -249,39 +233,27 @@ class ZEMZEVPoweredDescentGuidance:
         for k in range(N):
             t_go = t_final - t
 
-            # TODO: Find a better way to handle the end of flight condition. Right now we just break the loop when t_go gets very small
-            # Guard against numerical issues at end of flight
-            if t_go < 0.001:
-                break
-
-            # Control law
-            state = np.concatenate((r, v, [m]))
+            # Guidance law: saturated ZEM/ZEV acceleration command, converted to thrust
+            state = X_hist[:, k]
+            m = state[State.M]
             a_cmd = self._compute_accel_command(state, r_target, v_target, t_go, N_pred)
             a_cmd = self._saturate_accel_command(a_cmd, m)
             u = m * a_cmd
 
-            # State propagation
-            X = self._rk4_step(state, u, dt)
-            r = X[State.X:State.Z+1]
-            v = X[State.VX:State.VZ+1]
-            m = X[State.M]
+            # State propagation, holding u constant from node k to node k+1
+            X_hist[:, k+1] = self._rk4_step(state, u, dt)
+            U_hist[:, k] = u
             t = t + dt
+            t_hist[k+1] = t
 
-            r_hist.append(r.copy())
-            v_hist.append(v.copy())
-            m_hist.append(m)
-            u_hist.append(u.copy())
-            t_hist.append(t)
-
-        r_hist = np.asarray(r_hist, dtype=float).T
-        v_hist = np.asarray(v_hist, dtype=float).T
-        m_hist = np.asarray(m_hist, dtype=float)
-        u_hist = np.asarray(u_hist, dtype=float).T
-        t_hist = np.asarray(t_hist, dtype=float)
+        # No control is applied after the final node (t_go = 0 there), so hold the last one
+        U_hist[:, N] = U_hist[:, N-1]
 
         # Final error check
-        pos_error = np.linalg.norm(r_hist[:, -1] - r_target)
-        vel_error = np.linalg.norm(v_hist[:, -1] - v_target)
+        r_final = np.array([X_hist[State.X, -1], X_hist[State.Y, -1], X_hist[State.Z, -1]])
+        v_final = np.array([X_hist[State.VX, -1], X_hist[State.VY, -1], X_hist[State.VZ, -1]])
+        pos_error = np.linalg.norm(r_final - r_target)
+        vel_error = np.linalg.norm(v_final - v_target)
 
         if verbose:
             print(f"Final position error: {pos_error:.2f} m")
@@ -289,8 +261,8 @@ class ZEMZEVPoweredDescentGuidance:
 
         return {
             't': t_hist,
-            'X': np.vstack((r_hist, v_hist, m_hist)),
-            'U': u_hist,
+            'X': X_hist,
+            'U': U_hist,
         }
 
     def find_best_trajectory(self, initial_conditions: np.ndarray, terminal_conditions: np.ndarray, t_min: float, t_max: float, t_tol: float, r_tol: float, v_tol: float, N: int, N_final: int, N_pred: int, verbose: bool = False) -> dict:
